@@ -1,4 +1,4 @@
-"""Behavioral contract for per-run API toolset narrowing."""
+"""Behavioral contract for per-run API toolset narrowing and session locks."""
 
 import asyncio
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server_runs import _validate_run_toolsets
 
 
 _CONFIG = {"platform_toolsets": {"api_server": ["file", "web"]}}
@@ -46,8 +47,6 @@ class TestRunToolsetRequest:
         ],
     )
     def test_request_toolsets_have_explicit_subset_semantics(self, body, expected):
-        from gateway.platforms.api_server import _validate_run_toolsets
-
         assert _validate_run_toolsets(body, {"file", "web"}) == expected
 
     @pytest.mark.parametrize(
@@ -63,8 +62,6 @@ class TestRunToolsetRequest:
         ],
     )
     def test_invalid_toolset_requests_fail_closed(self, toolsets):
-        from gateway.platforms.api_server import _validate_run_toolsets
-
         with pytest.raises(ValueError):
             _validate_run_toolsets({"toolsets": toolsets}, {"file", "web"})
 
@@ -147,7 +144,7 @@ class TestRunToolsetConstruction:
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
                 "api_key": "test-key", "base_url": None, "provider": None,
-                "api_mode": None, "command": None, "args": [],
+                "api_mode": None, "command": [], "args": [],
             }),
             patch("gateway.run._resolve_gateway_model", return_value="test/model"),
             patch("gateway.run._load_gateway_config", return_value=_CONFIG),
@@ -159,3 +156,185 @@ class TestRunToolsetConstruction:
                 room_dispatch={"room_id": "room"}, room_execution_policy={}, requested_toolsets=["web"])
 
         assert agent_cls.call_args.kwargs["enabled_toolsets"] == []
+
+
+def test_configured_unknown_passthrough_is_not_a_valid_requested_toolset(monkeypatch):
+    config = {"platform_toolsets": {"api_server": ["file", "definitely_unknown"]}}
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+    from hermes_cli.tools_config import _get_platform_tools
+
+    available = _get_platform_tools(config, "api_server")
+
+    assert "definitely_unknown" in available
+    with pytest.raises(ValueError, match="unknown"):
+        _validate_run_toolsets({"toolsets": ["definitely_unknown"]}, available)
+
+
+def test_enabled_mcp_alias_remains_a_valid_requested_toolset(monkeypatch):
+    from tools.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(
+        name="mcp__runserver__ping", toolset="mcp-runserver",
+        schema={"name": "mcp__runserver__ping", "description": "Ping", "parameters": {}},
+        handler=lambda _args, **_kwargs: "{}")
+    registry.register_toolset_alias("runserver", "mcp-runserver")
+    monkeypatch.setattr("tools.registry.registry", registry)
+
+    assert _validate_run_toolsets({"toolsets": ["runserver"]}, {"runserver"}) == ["runserver"]
+
+
+class _CompletedRunAgent:
+    provider = "openrouter"
+    model = "locked/model"
+    session_prompt_tokens = 1
+    session_completion_tokens = 2
+    session_total_tokens = 3
+    _hermes_api_runtime = {
+        "provider": "openrouter", "model": "locked/model", "route_source": "session_model_lock"}
+
+    def run_conversation(self, **_kwargs):
+        return {"final_response": "done"}
+
+
+def _session_app(adapter):
+    app = _app(adapter)
+    app.router.add_post("/api/sessions", adapter._handle_create_session)
+    app.router.add_post("/api/sessions/{session_id}/model", adapter._handle_session_model_lock)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_run_uses_persisted_browser_lock_and_reports_effective_runtime():
+    adapter = _adapter()
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        created = await cli.post("/api/sessions", json={"id": "locked-session"})
+        assert created.status == 201
+        locked = await cli.post(
+            "/api/sessions/locked-session/model",
+            json={"model": "locked/model", "provider": "openrouter"},
+        )
+        assert locked.status == 200
+        with patch.object(adapter, "_create_agent", return_value=_CompletedRunAgent()) as create:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello", "session_id": "locked-session"})
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            for _ in range(40):
+                if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                    break
+                await asyncio.sleep(0.01)
+
+        assert create.call_args.kwargs["requested_model"] == "locked/model"
+        assert create.call_args.kwargs["requested_provider"] == "openrouter"
+        assert create.call_args.kwargs["confirmed_runtime_lock"] is True
+        assert adapter._run_statuses[run_id]["runtime"] == {
+            "provider": "openrouter", "model": "locked/model", "route_source": "session_model_lock"}
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_persisted_lock_when_its_model_route_disappears():
+    adapter = _adapter()
+    adapter._model_routes = {
+        "locked-alias": {"model": "locked/model", "provider": "openrouter"}}
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "route-session"})).status == 201
+        assert (await cli.post(
+            "/api/sessions/route-session/model", json={"model": "locked-alias"})).status == 200
+        adapter._model_routes = {}
+        with patch.object(adapter, "_create_agent") as create:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello", "session_id": "route-session"})
+            payload = await response.json()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "model_lock_unavailable"
+    create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_body_runtime_that_conflicts_with_persisted_lock():
+    adapter = _adapter()
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "conflict-session"})).status == 201
+        assert (await cli.post(
+            "/api/sessions/conflict-session/model",
+            json={"model": "locked/model", "provider": "openrouter"},
+        )).status == 200
+        with patch.object(adapter, "_create_agent") as create:
+            response = await cli.post(
+                "/v1/runs",
+                json={
+                    "input": "hello", "session_id": "conflict-session",
+                    "model": "other/model", "provider": "other-provider",
+                },
+            )
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "model_lock_conflict"
+    create.assert_not_called()
+
+
+def test_confirmed_lock_rejects_an_agent_that_resolves_to_a_different_runtime():
+    adapter = _adapter()
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+            "api_key": "test-key", "base_url": None, "provider": None,
+            "api_mode": None, "command": None, "args": [],
+        }),
+        patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+        patch("gateway.run._load_gateway_config", return_value=_CONFIG),
+        patch.object(adapter, "_resolve_provider_runtime", return_value={"provider": "openrouter"}),
+        patch("run_agent.AIAgent", return_value=SimpleNamespace(provider="other", model="other/model")),
+    ):
+        with pytest.raises(RuntimeError, match="confirmed model lock runtime mismatch"):
+            adapter._create_agent(
+                requested_model="locked/model", requested_provider="openrouter",
+                route={"model": "locked/model", "provider": "openrouter"},
+                confirmed_runtime_lock=True)
+
+
+def test_confirmed_lock_disables_fallback_and_reports_locked_runtime():
+    adapter = _adapter()
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+            "api_key": "test-key", "base_url": None, "provider": None,
+            "api_mode": None, "command": None, "args": []}),
+        patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+        patch("gateway.run._load_gateway_config", return_value=_CONFIG),
+        patch.object(adapter, "_resolve_provider_runtime", return_value={"provider": "openrouter"}),
+        patch("run_agent.AIAgent", return_value=SimpleNamespace(
+            provider="openrouter", model="locked/model")) as agent_cls,
+    ):
+        agent = adapter._create_agent(
+            requested_model="locked/model", requested_provider="openrouter",
+            route={"model": "locked/model", "provider": "openrouter"},
+            confirmed_runtime_lock=True)
+
+    assert agent is not None
+    assert agent_cls.call_args.kwargs["fallback_model"] is None
+    assert agent._hermes_api_runtime == {
+        "provider": "openrouter", "model": "locked/model",
+        "route_source": "session_model_lock", "model_lock": "confirmed"}
+
+
+def test_create_agent_real_import_resolves_selected_tool_definitions():
+    adapter = _adapter()
+    runtime = {
+        "api_key": "test-key", "base_url": "http://127.0.0.1:1/v1", "provider": None,
+        "api_mode": "chat_completions", "command": None, "args": [],
+    }
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value=runtime),
+        patch("gateway.run._resolve_gateway_model", return_value="test/model"),
+        patch("gateway.run._load_gateway_config", return_value=_CONFIG),
+    ):
+        web_agent = adapter._create_agent(requested_toolsets=["web"])
+        empty_agent = adapter._create_agent(requested_toolsets=[])
+
+    web_names = {tool["function"]["name"] for tool in web_agent.tools}
+    empty_names = {tool["function"]["name"] for tool in empty_agent.tools}
+    assert {"web_search", "web_extract"} <= web_names
+    assert "terminal" not in web_names
+    assert empty_names == set()

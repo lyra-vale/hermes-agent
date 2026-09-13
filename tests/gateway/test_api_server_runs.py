@@ -2112,7 +2112,7 @@ class TestHostedRoomRuns:
                 create.return_value = agent
                 started = await cli.post(
                     "/v1/runs",
-                    json={"input": prompt, "hosted_room_dispatch": dispatch},
+                    json={"input": prompt, "toolsets": ["bot_room"], "hosted_room_dispatch": dispatch},
                     headers={
                         "Authorization": f"HermesRoom {grant}",
                         "Idempotency-Key": "room:task-room-1:1",
@@ -2132,6 +2132,7 @@ class TestHostedRoomRuns:
                     await asyncio.sleep(0.05)
             assert status.status == 200
             assert status_body["output"] == "Scoped room reply."
+            assert create.call_args.kwargs["requested_toolsets"] == ["bot_room"]
             session_id = status_body["session_id"]
             db = await adapter._ensure_session_db_async()
             row = db.get_session(session_id)

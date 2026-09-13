@@ -345,44 +345,6 @@ def _request_agent_overrides(
     return overrides
 
 
-_MAX_RUN_TOOLSET_ENTRIES = 64
-_MAX_RUN_TOOLSET_NAME_LENGTH = 128
-
-
-def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[str]]:
-    """Validate the optional ``POST /v1/runs`` ``toolsets`` narrowing field.
-
-    ``None`` means the field was omitted and preserves the configured API-server
-    selection.  A list is an exact allowlist of already-enabled API-server
-    toolset names; an empty list therefore creates an agent with no toolsets.
-    Validation is deliberately strict so malformed, duplicate, unknown, or
-    unavailable names cannot turn into a broader selection downstream.
-    """
-    if not isinstance(body, dict) or "toolsets" not in body:
-        return None
-    requested = body["toolsets"]
-    if not isinstance(requested, list) or len(requested) > _MAX_RUN_TOOLSET_ENTRIES:
-        raise ValueError("toolsets must be an array of at most 64 names")
-    available = {str(name) for name in (available_toolsets or ())}
-    seen = set()
-    result: List[str] = []
-    for name in requested:
-        if (
-            not isinstance(name, str)
-            or not name
-            or len(name) > _MAX_RUN_TOOLSET_NAME_LENGTH
-            or name != name.strip()
-        ):
-            raise ValueError("toolsets entries must be non-empty names of at most 128 characters")
-        if name in seen:
-            raise ValueError("toolsets entries must be unique")
-        if name not in available:
-            raise ValueError("toolsets contains an unavailable entry")
-        seen.add(name)
-        result.append(name)
-    return result
-
-
 def _request_relay_metadata(body: Any) -> Dict[str, Any]:
     """Extract Relay metadata from an OpenAI request body."""
     if not isinstance(body, dict):
@@ -1943,10 +1905,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _effective_session_runtime_request(
         self, *, session: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Dict[str, Any]:
         runtime_request = self._session_runtime_request_from_body(body)
-        requested = runtime_request.get("requested") or {}
-        if requested.get("model") or requested.get("provider"):
-            return runtime_request
-        return self._runtime_request_from_persisted_session_lock(session, body) or runtime_request
+        persisted = self._runtime_request_from_persisted_session_lock(session, body)
+        if persisted:
+            requested = runtime_request.get("requested") or {}
+            locked = persisted.get("requested") or {}
+            if any(requested.get(key) and requested.get(key) != locked.get(key)
+                   for key in ("model", "provider")):
+                raise ValueError("Request conflicts with the session's confirmed model lock")
+            if (runtime_request.get("model_options")
+                    and runtime_request.get("model_options") != persisted.get("model_options")):
+                raise ValueError("Request conflicts with the session's confirmed model lock")
+            return persisted
+        return runtime_request
 
     @classmethod
     def _sanitize_runtime_metadata(
@@ -2226,10 +2196,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
             else "raw_request" if route or request_model or request_provider else "global")
-        agent._hermes_api_runtime = {
-            "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
-            "model": getattr(agent, "model", None) or model,
-            "route_source": route_source}
+        actual_provider = getattr(agent, "provider", "")
+        actual_model = getattr(agent, "model", "")
+        actual_provider = actual_provider if isinstance(actual_provider, str) else ""
+        actual_model = actual_model if isinstance(actual_model, str) else ""
+        expected_provider = self._clean_runtime_id(
+            (route or {}).get("provider") or requested_provider or runtime_kwargs.get("provider"), max_len=80)
+        expected_model = _clean_request_string((route or {}).get("model") or requested_model or model)
+        if confirmed_runtime_lock and (
+            (expected_provider and actual_provider != expected_provider)
+            or (expected_model and actual_model != expected_model)):
+            raise RuntimeError(
+                "confirmed model lock runtime mismatch: "
+                f"expected provider={expected_provider or '<unspecified>'} model={expected_model or '<unspecified>'}; "
+                f"actual provider={actual_provider or '<unknown>'} model={actual_model or '<unknown>'}")
+        agent._hermes_api_runtime = self._sanitize_runtime_metadata(
+            runtime={
+                "provider": actual_provider or runtime_kwargs.get("provider") or "",
+                "model": actual_model or model,
+                "route_source": route_source},
+            route_source=route_source,
+            model_lock=("confirmed" if confirmed_runtime_lock else ""))
         return agent
 
     # -- HTTP handlers ----------------------------------------------------------------
@@ -3076,7 +3063,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return None, _error_response("system_message must be a string", 400, code="invalid_system_message")
-        runtime_request = self._effective_session_runtime_request(session=session, body=body)
+        try:
+            runtime_request = self._effective_session_runtime_request(session=session, body=body)
+        except ValueError as exc:
+            return None, _error_response(str(exc), 400, code="model_lock_conflict")
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error

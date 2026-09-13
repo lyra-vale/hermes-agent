@@ -27,6 +27,8 @@ from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+_MAX_RUN_TOOLSET_ENTRIES = 64
+_MAX_RUN_TOOLSET_NAME_LENGTH = 128
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -47,6 +49,43 @@ _FIXED_EVENT_FIELDS = {
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
+
+
+def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[str]]:
+    """Validate the optional ``POST /v1/runs`` ``toolsets`` narrowing field.
+
+    ``None`` means the field was omitted and preserves the configured API-server
+    selection. A list is an exact allowlist of already-enabled, canonically
+    registered toolset names; an empty list therefore creates an agent with no
+    toolsets. Validation is strict so malformed, duplicate, unknown, or
+    unavailable names cannot broaden the selection downstream.
+    """
+    if not isinstance(body, dict) or "toolsets" not in body:
+        return None
+    requested = body["toolsets"]
+    if not isinstance(requested, list) or len(requested) > _MAX_RUN_TOOLSET_ENTRIES:
+        raise ValueError("toolsets must be an array of at most 64 names")
+    available = {str(name) for name in (available_toolsets or ())}
+    from toolsets import validate_toolset
+    seen = set()
+    result: List[str] = []
+    for name in requested:
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > _MAX_RUN_TOOLSET_NAME_LENGTH
+            or name != name.strip()
+        ):
+            raise ValueError("toolsets entries must be non-empty names of at most 128 characters")
+        if name in seen:
+            raise ValueError("toolsets entries must be unique")
+        if not validate_toolset(name):
+            raise ValueError("toolsets contains an unknown entry")
+        if name not in available:
+            raise ValueError("toolsets contains an unavailable entry")
+        seen.add(name)
+        result.append(name)
+    return result
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -399,22 +438,31 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return room_error
     if not isinstance(body, dict):
         return _json_error(_openai_error, "Request body must be a JSON object", status=400)
+    room_dispatch, room_execution_policy = (
+        v if isinstance(v, dict) else None for v in (
+            (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
+            if isinstance(body, dict) else (None, None)))
     requested_toolsets = None
     if "toolsets" in body:
         try:
-            from gateway.run import _load_gateway_config
-            from hermes_cli.tools_config import _get_platform_tools
-            requested_toolsets = _api_server._validate_run_toolsets(
-                body, _get_platform_tools(_load_gateway_config(), "api_server"))
+            from hermes_cli.plugins import discover_plugins
+            from tools.mcp_tool_discovery import discover_mcp_tools
+            discover_plugins()
+            discover_mcp_tools()
+            if room_dispatch is not None:
+                from gateway.hosted_room_execution_policy import RoomExecutionPolicy
+                available_toolsets = RoomExecutionPolicy.from_mapping(
+                    room_execution_policy or {}).enabled_toolsets
+            else:
+                from gateway.run import _load_gateway_config
+                from hermes_cli.tools_config import _get_platform_tools
+                available_toolsets = _get_platform_tools(_load_gateway_config(), "api_server")
+            requested_toolsets = _validate_run_toolsets(body, available_toolsets)
         except ValueError as exc:
             return _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
         except Exception:
             logger.exception("/v1/runs toolset narrowing resolution failed")
             return _json_error(_openai_error, "Unable to validate requested toolsets", code="invalid_toolsets", status=400)
-    room_dispatch, room_execution_policy = (
-        v if isinstance(v, dict) else None for v in (
-            (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
-            if isinstance(body, dict) else (None, None)))
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
         return _json_error(
@@ -446,14 +494,39 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
-    route = self._resolve_route(body.get("model"))
-    agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
-    selection_error = self._request_route_conflict_error(
-        session_id=session_id, gateway_session_key=gateway_session_key,
-        requested_model=agent_overrides.get("requested_model"),
-        requested_provider=agent_overrides.get("requested_provider"), route=route)
-    if selection_error:
-        return _json_error(_openai_error, selection_error, status=400)
+    session = None
+    runtime_request = None
+    if session_id:
+        db = await self._ensure_session_db_async()
+        if db is not None:
+            session = await asyncio.to_thread(db.get_session, str(session_id))
+            if session:
+                try:
+                    runtime_request = self._effective_session_runtime_request(session=session, body=body)
+                except ValueError as exc:
+                    return _json_error(_openai_error, str(exc), code="model_lock_conflict", status=400)
+    lock_active = bool(runtime_request and runtime_request.get("require_model_lock"))
+    if lock_active:
+        route = runtime_request.get("route")
+        requested = runtime_request.get("requested") or {}
+        agent_overrides = {
+            dst_key: requested[src_key]
+            for src_key, dst_key in (("model", "requested_model"), ("provider", "requested_provider"))
+            if requested.get(src_key)}
+        if runtime_request.get("model_options"):
+            agent_overrides["model_options"] = runtime_request["model_options"]
+        lock_error = self._runtime_lock_error(runtime_request)
+        if lock_error is not None:
+            return lock_error
+    else:
+        route = self._resolve_route(body.get("model"))
+        agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
+        selection_error = self._request_route_conflict_error(
+            session_id=session_id, gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"), route=route)
+        if selection_error:
+            return _json_error(_openai_error, selection_error, status=400)
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
     if idempotency_key:
@@ -515,6 +588,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # construction call shape byte-for-byte compatible for existing clients.
     if requested_toolsets is not None:
         agent_kwargs["requested_toolsets"] = requested_toolsets
+    if lock_active:
+        agent_kwargs["confirmed_runtime_lock"] = True
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -652,6 +727,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
+        raw_runtime_metadata = getattr(agent, "_hermes_api_runtime", None)
+        runtime_metadata = None
+        if isinstance(raw_runtime_metadata, dict):
+            runtime_metadata = dict(raw_runtime_metadata)
+            self._set_run_status(
+                run_id, "running", model=runtime_metadata.get("model"), runtime=runtime_metadata)
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
@@ -665,6 +746,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
+            if runtime_metadata is not None:
+                extra["runtime"] = runtime_metadata
             _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")

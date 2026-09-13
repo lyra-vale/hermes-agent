@@ -66,9 +66,9 @@ async def _normalize_room_dispatch(
     _openai_error, room_token = _api_server._openai_error, self._room_grant_token(request)
     if not room_token:
         return body, None
-    if not isinstance(body, dict) or set(body) - {"input", "hosted_room_dispatch"}:
+    if not isinstance(body, dict) or set(body) - {"input", "hosted_room_dispatch", "toolsets"}:
         return body, _json_error(
-            _openai_error, "Room dispatch accepts only input and hosted_room_dispatch.",
+            _openai_error, "Room dispatch accepts only input, toolsets, and hosted_room_dispatch.",
             code="invalid_room_dispatch", status=400)
     try:
         from gateway import hosted_rooms
@@ -94,11 +94,17 @@ async def _normalize_room_dispatch(
         if request.headers.get("Idempotency-Key", "").strip() != expected_key:
             raise ValueError("room dispatch idempotency key is invalid")
         session_id = await self._ensure_hosted_member_session(dispatch)
-        return {
+        normalized = {
             "input": dispatch.prompt,
             "session_id": session_id,
             "hosted_room_dispatch": dispatch.as_mapping(),
             "_room_execution_policy": policy.as_mapping(),
-        }, None
+        }
+        if "toolsets" in body:
+            from gateway.platforms.api_server_runs import _validate_run_toolsets
+            normalized["toolsets"] = _validate_run_toolsets(body, policy.enabled_toolsets)
+        return normalized, None
     except Exception as exc:
+        if str(exc).startswith("toolsets"):
+            return body, _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
         return body, _room_dispatch_error(exc, _openai_error=_openai_error)
