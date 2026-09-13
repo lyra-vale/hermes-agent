@@ -441,6 +441,11 @@ class MemoryManager:
     def _effective_tool_surface(self) -> str:
         return self._tool_surface or _MEMORY_SURFACE_FULL
 
+    @property
+    def automatic_ingestion_enabled(self) -> bool:
+        """Whether automatic provider hooks may receive conversation content."""
+        return self._effective_tool_surface == _MEMORY_SURFACE_FULL
+
     def configure_tool_surface(self, surface: str) -> None:
         """Freeze the provider surface selected during AIAgent construction."""
         if surface not in {_MEMORY_SURFACE_NONE, _MEMORY_SURFACE_APPEND, _MEMORY_SURFACE_FULL}:
@@ -636,6 +641,8 @@ class MemoryManager:
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
         ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
         """
+        if not self.automatic_ingestion_enabled:
+            return
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content:
@@ -769,6 +776,9 @@ class MemoryManager:
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        if not self.automatic_ingestion_enabled:
+            return
+
         def _tick(p: MemoryProvider) -> None:
             # A provider written before the author kwargs declares (turn_number, message) only; it still gets its tick.
             params = _signature_params(p.on_turn_start)
@@ -778,6 +788,8 @@ class MemoryManager:
         self._each_provider("on_turn_start failed", _tick)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        if not self.automatic_ingestion_enabled:
+            return
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
                             exc_info=True)
 
@@ -800,13 +812,14 @@ class MemoryManager:
         """
         if not self._providers:
             return
-        snapshot = list(messages or [])
+        snapshot = list(messages or []) if self.automatic_ingestion_enabled else []
 
         def _run() -> None:  # both hooks already guard per-provider
-            try:
-                self.on_session_end(snapshot)
-            except Exception as e:  # pragma: no cover
-                logger.warning("Session-boundary extraction failed: %s", e)
+            if self.automatic_ingestion_enabled:
+                try:
+                    self.on_session_end(snapshot)
+                except Exception as e:  # pragma: no cover
+                    logger.warning("Session-boundary extraction failed: %s", e)
             try:
                 self.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
             except Exception as e:  # pragma: no cover
@@ -838,7 +851,7 @@ class MemoryManager:
 
     def supports_pre_compress_checkpoint(self, api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION) -> bool:
         """Return whether an active provider guarantees checkpoint API support."""
-        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+        if not self.automatic_ingestion_enabled:
             return False
         versions = (self._checkpoint_api_version(p) for p in self._providers)
         return any(v is not None and v >= api_version for v in versions)
@@ -852,7 +865,7 @@ class MemoryManager:
         only to checkpoint (v2+) providers. With ``require_checkpoint`` at least one checkpoint provider
         must succeed — its exception propagates so the caller keeps the uncompressed transcript.
         """
-        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+        if not self.automatic_ingestion_enabled:
             if require_checkpoint:
                 raise RuntimeError("Memory provider is not exposed in this session")
             return ""
@@ -896,6 +909,8 @@ class MemoryManager:
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
         """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
+        if not self.automatic_ingestion_enabled:
+            return
 
         def _notify(provider: MemoryProvider) -> None:
             mode = self._provider_memory_write_metadata_mode(provider)
@@ -950,6 +965,8 @@ class MemoryManager:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        if not self.automatic_ingestion_enabled:
+            return
         self._each_provider(
             "on_delegation failed",
             lambda p: p.on_delegation(task, result, child_session_id=child_session_id, **kwargs),
