@@ -19,6 +19,7 @@ from hermes_state_common import (
     _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
     _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
 )
+from gateway.model_lock_options import canonicalize_model_options
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -709,7 +710,8 @@ class SessionSessionsMixin:
         """Persist a Browser / API-client runtime lock into model_config (lineage markers survive); null
         system_prompt so cached footers cannot lie."""
         lock = {
-            "provider": provider or "", "model": model or "", "model_options": model_options or {},
+            "provider": provider or "", "model": model or "",
+            "model_options": canonicalize_model_options(model_options),
             "route_source": route_source or "", "confirmed": bool(confirmed), "updated_at": time.time(),
         }
         if isinstance(route_snapshot, dict):

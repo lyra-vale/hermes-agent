@@ -282,10 +282,11 @@ async def test_run_rejects_body_runtime_that_conflicts_with_persisted_lock():
     [
         (None, True),
         ({"service_tier": "priority"}, True),
+        ({"service_tier": "PRIORITY"}, True),
         ({}, False),
         ({"service_tier": "default"}, False),
     ],
-    ids=["absent", "same", "empty", "different"],
+    ids=["absent", "same", "equivalent", "empty", "different"],
 )
 async def test_run_enforces_persisted_model_options_exactly(body_options, accepted):
     adapter = _adapter()
@@ -379,6 +380,48 @@ async def test_run_persisted_route_lock_accepts_unchanged_alias_target_and_rejec
     assert response.status == 409
     assert payload["error"]["code"] == "model_lock_unavailable"
     drift_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_idempotency_replays_locked_alias_after_route_drift():
+    adapter = _adapter()
+    adapter._model_routes = {
+        "locked-alias": {"model": "locked/model", "provider": "openrouter"}}
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "replay-alias-session"})).status == 201
+        assert (await cli.post(
+            "/api/sessions/replay-alias-session/model",
+            json={"model": "locked-alias"},
+        )).status == 200
+        with patch.object(adapter, "_create_agent", return_value=_CompletedRunAgent()) as create:
+            headers = {"Idempotency-Key": "locked-alias-replay"}
+            first = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "session_id": "replay-alias-session"},
+                headers=headers,
+            )
+            first_body = await first.json()
+            adapter._model_routes = {}
+            replay = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "session_id": "replay-alias-session"},
+                headers=headers,
+            )
+            replay_body = await replay.json()
+            fresh = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "session_id": "replay-alias-session"},
+                headers={"Idempotency-Key": "locked-alias-new"},
+            )
+            fresh_body = await fresh.json()
+
+    assert first.status == 202
+    assert replay.status == 202
+    assert replay_body["run_id"] == first_body["run_id"]
+    assert replay_body["replayed"] is True
+    assert fresh.status == 409
+    assert fresh_body["error"]["code"] == "model_lock_unavailable"
+    create.assert_called_once()
 
 
 def test_confirmed_lock_rejects_an_agent_that_resolves_to_a_different_runtime():

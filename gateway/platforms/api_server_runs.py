@@ -23,6 +23,7 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
+from gateway.model_lock_options import canonicalize_model_options
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
@@ -109,11 +110,15 @@ def _effective_run_runtime_request(
         for key in ("model", "provider")
     ):
         raise ValueError("Request conflicts with the session's confirmed model lock")
-    if "model_options" in body and (
-        not isinstance(body["model_options"], dict)
-        or body["model_options"] != persisted.get("model_options", {})
-    ):
-        raise ValueError("Request conflicts with the session's confirmed model lock")
+    if "model_options" in body:
+        if not isinstance(body["model_options"], dict):
+            raise ValueError("Request contains invalid model lock options")
+        try:
+            request_options = canonicalize_model_options(body["model_options"])
+        except ValueError as exc:
+            raise ValueError("Request contains invalid model lock options") from exc
+        if request_options != persisted.get("model_options", {}):
+            raise ValueError("Request conflicts with the session's confirmed model lock")
     return persisted
 
 
@@ -521,6 +526,14 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
     if history_err is not None:
         return history_err
+    # Replay the admitted run before reading mutable session locks or model routes. A route alias may
+    # disappear after admission; it must not invalidate an exact retry of that already-owned run.
+    if idempotency_key:
+        outcome, record = self._run_idempotency_store.lookup(
+            idempotency_scope, idempotency_key, idempotency_fingerprint,
+            retention_until=_room_retention_until(request))
+        if outcome == "conflict" or (outcome == "reused" and record is not None):
+            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
     session = None
@@ -568,14 +581,6 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             requested_provider=agent_overrides.get("requested_provider"), route=route)
         if selection_error:
             return _json_error(_openai_error, selection_error, status=400)
-    # A lost-acceptance replay must resolve even while the original run holds the last
-    # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if idempotency_key:
-        outcome, record = self._run_idempotency_store.lookup(
-            idempotency_scope, idempotency_key, idempotency_fingerprint,
-            retention_until=_room_retention_until(request))
-        if outcome == "conflict" or (outcome == "reused" and record is not None):
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:

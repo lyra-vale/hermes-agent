@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import json as _json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -546,6 +547,106 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
     assert model_config["browser_model_lock"]["provider"] == "nous"
     assert model_config["browser_model_lock"]["model"] == "x-ai/grok-4.5"
     assert model_config["browser_model_lock"]["confirmed"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_confirmation", [False, True])
+async def test_model_lock_rejects_credential_bearing_options_without_persisting_them(
+    adapter, session_db, via_confirmation
+):
+    app = _create_session_app(adapter)
+    _register_session_model_route(app, adapter)
+    secret_options = {
+        "api_key": "sk-do-not-persist",
+        "base_url": "https://secret.example/v1",
+        "nested": {"token": "also-secret"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        if via_confirmation:
+            assert (await cli.post("/api/sessions", json={"id": "unsafe-lock"})).status == 201
+            response = await cli.post(
+                "/api/sessions/unsafe-lock/model",
+                json={
+                    "model": "locked/model", "provider": "openrouter",
+                    "model_options": secret_options,
+                },
+            )
+            session_id = "unsafe-lock"
+        else:
+            response = await cli.post(
+                "/api/sessions",
+                json={
+                    "id": "unsafe-create", "model": "locked/model", "provider": "openrouter",
+                    "require_model_lock": True, "model_options": secret_options,
+                },
+            )
+            session_id = "unsafe-create"
+        response_text = await response.text()
+
+    assert response.status == 400
+    row = session_db.get_session(session_id)
+    assert row is None or not row.get("model_config")
+    assert "sk-do-not-persist" not in response_text
+
+
+@pytest.mark.asyncio
+async def test_model_lock_options_round_trip_to_one_bounded_canonical_shape(adapter, session_db):
+    app = _create_session_app(adapter)
+    _register_session_model_route(app, adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "canonical-lock", "model": "locked/model", "provider": "openrouter",
+                "require_model_lock": True,
+                "model_options": {"reasoning": {"effort": "HIGH"}, "fast": True},
+            },
+        )
+        assert response.status == 201, await response.text()
+        first = session_db.get_session("canonical-lock")
+        first_config = _json.loads(first["model_config"])
+        assert first_config["browser_model_lock"]["model_options"] == {
+            "reasoning": {"enabled": True, "effort": "high"},
+            "service_tier": "priority",
+        }
+
+        response = await cli.post(
+            "/api/sessions/canonical-lock/model",
+            json={
+                "model": "locked/model", "provider": "openrouter",
+                "model_options": {
+                    "reasoning": {"enabled": True, "effort": "high"},
+                    "service_tier": "priority",
+                },
+            },
+        )
+        assert response.status == 200, await response.text()
+
+    second = session_db.get_session("canonical-lock")
+    second_config = _json.loads(second["model_config"])
+    assert second_config["browser_model_lock"]["model_options"] == first_config[
+        "browser_model_lock"
+    ]["model_options"]
+
+
+@pytest.mark.asyncio
+async def test_existing_unsafe_persisted_lock_fails_closed_without_exposing_options(adapter, session_db):
+    session_id = session_db.create_session("unsafe-existing-lock", "api_server")
+    session_db.patch_session_model_config(
+        session_id,
+        {"browser_model_lock": {
+            "model": "locked/model", "provider": "openrouter", "confirmed": True,
+            "model_options": {"api_key": "sk-old-secret"},
+        }},
+    )
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{session_id}/chat", json={"message": "hello"})
+        response_text = await response.text()
+
+    assert response.status == 400
+    assert "sk-old-secret" not in response_text
 
 
 @pytest.mark.asyncio

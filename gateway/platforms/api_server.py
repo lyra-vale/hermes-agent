@@ -123,6 +123,7 @@ from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from gateway.model_lock_options import canonicalize_model_options
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1795,7 +1796,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_options["service_tier"] = "priority"
         return runtime_options
 
-    def _session_runtime_request_from_body(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _session_runtime_request_from_body(
+        self, body: Dict[str, Any], *, canonicalize_options: bool = False
+    ) -> Dict[str, Any]:
         raw_model = self._clean_runtime_id(body.get("model") or body.get("model_id"))
         raw_provider = self._clean_runtime_id(body.get("provider") or body.get("provider_id"), max_len=80)
         prefixed_provider, split_model = self._split_provider_prefixed_model(raw_model)
@@ -1813,13 +1816,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if provider:
                 route["provider"] = provider
             route_source = "raw_request"
+        raw_model_options = body.get("model_options") if isinstance(body.get("model_options"), dict) else {}
+        if canonicalize_options and "model_options" in body:
+            if body["model_options"] is None:
+                raise ValueError("model_options contains unsupported or malformed values")
+            model_options = canonicalize_model_options(body["model_options"])
+        else:
+            model_options = raw_model_options
         return {
             "requested": {"provider": provider, "model": model, "raw_model": raw_model},
             "route": route, "route_source": route_source,
-            "runtime_options": self._runtime_options_from_model_options(body.get("model_options")),
+            "runtime_options": self._runtime_options_from_model_options(model_options),
             "require_model_lock": _coerce_request_bool(body.get("require_model_lock"), default=False),
-            "model_options": (
-                body.get("model_options") if isinstance(body.get("model_options"), dict) else {})}
+            "model_options": model_options,
+        }
 
     @classmethod
     def _requested_ids(cls, requested: Any) -> tuple[str, str]:
@@ -1914,11 +1924,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             route = {"model": model} if model else {}
             if provider:
                 route["provider"] = provider
-        model_options = body.get("model_options") if allow_body_model_options else lock.get("model_options")
-        if not isinstance(model_options, dict):
-            model_options = lock.get("model_options")
-        if not isinstance(model_options, dict):
-            model_options = {}
+        try:
+            locked_options = canonicalize_model_options(lock.get("model_options"))
+        except ValueError as exc:
+            raise ValueError("The session's persisted model lock is invalid") from exc
+        model_options = (
+            body.get("model_options") if allow_body_model_options and "model_options" in body
+            else locked_options)
         return {
             "requested": {"provider": provider, "model": model, "raw_model": model},
             "route": route or None, "route_source": "session_model_lock",
@@ -2873,7 +2885,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
         source = self._normalize_session_source(body.get("source") or "api_server")
-        runtime_request = self._session_runtime_request_from_body(body)
+        try:
+            runtime_request = self._session_runtime_request_from_body(body)
+        except ValueError as exc:
+            return _error_response(str(exc), 400, code="invalid_model_options")
+        if (
+            runtime_request.get("require_model_lock")
+            or (runtime_request.get("requested") or {}).get("model")
+            or (runtime_request.get("requested") or {}).get("provider")
+        ):
+            try:
+                runtime_request = self._session_runtime_request_from_body(body, canonicalize_options=True)
+            except ValueError as exc:
+                return _error_response(str(exc), 400, code="invalid_model_options")
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
@@ -3087,6 +3111,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_request = self._effective_session_runtime_request(session=session, body=body)
         except ValueError as exc:
             return None, _error_response(str(exc), 400, code="model_lock_conflict")
+        if runtime_request.get("require_model_lock") and not runtime_request.get("persisted_lock"):
+            try:
+                runtime_request = self._session_runtime_request_from_body(body, canonicalize_options=True)
+            except ValueError as exc:
+                return None, _error_response(str(exc), 400, code="invalid_model_options")
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error
@@ -3331,7 +3360,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        runtime_request = self._session_runtime_request_from_body(body)
+        try:
+            runtime_request = self._session_runtime_request_from_body(body, canonicalize_options=True)
+        except ValueError as exc:
+            return _error_response(str(exc), 400, code="invalid_model_options")
         runtime_request["require_model_lock"] = True
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
