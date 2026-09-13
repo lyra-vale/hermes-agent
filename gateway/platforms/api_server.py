@@ -345,6 +345,44 @@ def _request_agent_overrides(
     return overrides
 
 
+_MAX_RUN_TOOLSET_ENTRIES = 64
+_MAX_RUN_TOOLSET_NAME_LENGTH = 128
+
+
+def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[str]]:
+    """Validate the optional ``POST /v1/runs`` ``toolsets`` narrowing field.
+
+    ``None`` means the field was omitted and preserves the configured API-server
+    selection.  A list is an exact allowlist of already-enabled API-server
+    toolset names; an empty list therefore creates an agent with no toolsets.
+    Validation is deliberately strict so malformed, duplicate, unknown, or
+    unavailable names cannot turn into a broader selection downstream.
+    """
+    if not isinstance(body, dict) or "toolsets" not in body:
+        return None
+    requested = body["toolsets"]
+    if not isinstance(requested, list) or len(requested) > _MAX_RUN_TOOLSET_ENTRIES:
+        raise ValueError("toolsets must be an array of at most 64 names")
+    available = {str(name) for name in (available_toolsets or ())}
+    seen = set()
+    result: List[str] = []
+    for name in requested:
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > _MAX_RUN_TOOLSET_NAME_LENGTH
+            or name != name.strip()
+        ):
+            raise ValueError("toolsets entries must be non-empty names of at most 128 characters")
+        if name in seen:
+            raise ValueError("toolsets entries must be unique")
+        if name not in available:
+            raise ValueError("toolsets contains an unavailable entry")
+        seen.add(name)
+        result.append(name)
+    return result
+
+
 def _request_relay_metadata(body: Any) -> Dict[str, Any]:
     """Extract Relay metadata from an OpenAI request body."""
     if not isinstance(body, dict):
@@ -2121,7 +2159,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        requested_toolsets: Optional[List[str]] = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2155,6 +2194,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        # A request allowlist is always applied after the configured platform
+        # and hosted-room policy. It can only remove capabilities and cannot
+        # be bypassed by model/session selection or by room dispatch.
+        if requested_toolsets is not None:
+            requested = set(requested_toolsets)
+            enabled_toolsets = [name for name in enabled_toolsets if name in requested]
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:

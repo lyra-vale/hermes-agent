@@ -379,7 +379,12 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
-    """POST /v1/runs — start an agent run, return run_id immediately."""
+    """POST /v1/runs — start an agent run, return run_id immediately.
+
+    The optional ``toolsets`` body field is an exact list of names already
+    enabled for the API-server platform. It narrows one run only; omission
+    preserves the configured selection and ``[]`` means no toolsets.
+    """
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -392,6 +397,20 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    if not isinstance(body, dict):
+        return _json_error(_openai_error, "Request body must be a JSON object", status=400)
+    requested_toolsets = None
+    if "toolsets" in body:
+        try:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            requested_toolsets = _api_server._validate_run_toolsets(
+                body, _get_platform_tools(_load_gateway_config(), "api_server"))
+        except ValueError as exc:
+            return _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
+        except Exception:
+            logger.exception("/v1/runs toolset narrowing resolution failed")
+            return _json_error(_openai_error, "Unable to validate requested toolsets", code="invalid_toolsets", status=400)
     room_dispatch, room_execution_policy = (
         v if isinstance(v, dict) else None for v in (
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
@@ -488,13 +507,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    agent_kwargs = dict(
+        ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
+        route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+        **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")})
+    # Do not add a keyword for an omitted field: this keeps the established
+    # construction call shape byte-for-byte compatible for existing clients.
+    if requested_toolsets is not None:
+        agent_kwargs["requested_toolsets"] = requested_toolsets
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
-        agent_kwargs=dict(
-            ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
-            route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
-            **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
+        agent_kwargs=agent_kwargs,
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),

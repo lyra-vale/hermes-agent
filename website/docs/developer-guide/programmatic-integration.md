@@ -121,6 +121,15 @@ GET  /api/model/options          Provider-aware picker inventory
 GET  /health, /health/detailed
 ```
 
+`POST /v1/runs` accepts an optional `toolsets` JSON array to narrow that run's
+capabilities. Each entry must be a unique toolset name already enabled for the
+API-server platform; unknown, malformed, duplicate, or unavailable entries are
+rejected with `400 invalid_toolsets`. The field is an exact allowlist, so
+`"toolsets": []` gives the run no toolsets. Omitting it preserves the configured
+API-server selection. The narrowing is applied at `AIAgent` construction and
+cannot broaden or bypass hosted-room policy, session model selection, or
+`previous_response_id` continuation behavior.
+
 Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
 
 Browser extensions can opt into the disabled-by-default controller protocol to
