@@ -276,6 +276,111 @@ async def test_run_rejects_body_runtime_that_conflicts_with_persisted_lock():
     create.assert_not_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body_options", "accepted"),
+    [
+        (None, True),
+        ({"service_tier": "priority"}, True),
+        ({}, False),
+        ({"service_tier": "default"}, False),
+    ],
+    ids=["absent", "same", "empty", "different"],
+)
+async def test_run_enforces_persisted_model_options_exactly(body_options, accepted):
+    adapter = _adapter()
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "options-session"})).status == 201
+        assert (await cli.post(
+            "/api/sessions/options-session/model",
+            json={"model": "locked/model", "provider": "openrouter",
+                  "model_options": {"service_tier": "priority"}},
+        )).status == 200
+        with patch.object(adapter, "_create_agent", return_value=_CompletedRunAgent()) as create:
+            payload = {"input": "hello", "session_id": "options-session"}
+            if body_options is not None:
+                payload["model_options"] = body_options
+            response = await cli.post("/v1/runs", json=payload)
+            result = await response.json()
+
+    if accepted:
+        assert response.status == 202
+        create.assert_called_once()
+        assert create.call_args.kwargs["model_options"] == {"service_tier": "priority"}
+    else:
+        assert response.status == 400
+        assert result["error"]["code"] == "model_lock_conflict"
+        create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_requires_confirmed_existing_session_when_model_lock_is_required():
+    cases = (
+        ({"input": "hello", "require_model_lock": True}, "missing"),
+        ({"input": "hello", "session_id": "does-not-exist", "require_model_lock": True}, "unknown"),
+    )
+    for body, _case in cases:
+        adapter = _adapter()
+        async with TestClient(TestServer(_session_app(adapter))) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                response = await cli.post("/v1/runs", json=body)
+                payload = await response.json()
+        assert response.status == 409
+        assert payload["error"]["code"] == "model_lock_unavailable"
+        create.assert_not_called()
+
+    adapter = _adapter()
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "unlocked-session"})).status == 201
+        with patch.object(adapter, "_create_agent") as create:
+            response = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "session_id": "unlocked-session", "require_model_lock": True},
+            )
+            payload = await response.json()
+    assert response.status == 409
+    assert payload["error"]["code"] == "model_lock_unavailable"
+    create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_without_marker_keeps_arbitrary_session_compatibility():
+    adapter = _adapter()
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "arbitrary-session"})).status == 201
+        with patch.object(adapter, "_create_agent", return_value=_CompletedRunAgent()) as create:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello", "session_id": "arbitrary-session"})
+    assert response.status == 202
+    create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_persisted_route_lock_accepts_unchanged_alias_target_and_rejects_drift():
+    adapter = _adapter()
+    adapter._model_routes = {"locked-alias": {"model": "locked/model", "provider": "openrouter"}}
+    async with TestClient(TestServer(_session_app(adapter))) as cli:
+        assert (await cli.post("/api/sessions", json={"id": "alias-session"})).status == 201
+        assert (await cli.post(
+            "/api/sessions/alias-session/model", json={"model": "locked-alias"})).status == 200
+        with patch.object(adapter, "_create_agent", return_value=_CompletedRunAgent()) as create:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello", "session_id": "alias-session"})
+            assert response.status == 202
+            create.assert_called_once()
+            assert create.call_args.kwargs["route"] == {
+                "model": "locked/model", "provider": "openrouter"}
+        adapter._model_routes = {"locked-alias": {"model": "changed/model", "provider": "openrouter"}}
+        with patch.object(adapter, "_create_agent") as drift_create:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello", "session_id": "alias-session"})
+            payload = await response.json()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "model_lock_unavailable"
+    drift_create.assert_not_called()
+
+
 def test_confirmed_lock_rejects_an_agent_that_resolves_to_a_different_runtime():
     adapter = _adapter()
     with (
@@ -333,8 +438,9 @@ def test_create_agent_real_import_resolves_selected_tool_definitions():
         web_agent = adapter._create_agent(requested_toolsets=["web"])
         empty_agent = adapter._create_agent(requested_toolsets=[])
 
+    from toolsets import resolve_toolset
+
     web_names = {tool["function"]["name"] for tool in web_agent.tools}
     empty_names = {tool["function"]["name"] for tool in empty_agent.tools}
-    assert {"web_search", "web_extract"} <= web_names
-    assert "terminal" not in web_names
+    assert web_names == set(resolve_toolset("web"))
     assert empty_names == set()

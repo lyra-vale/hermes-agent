@@ -98,7 +98,8 @@ def _effective_run_runtime_request(
     runtime field must agree with it and the locked request is authoritative.
     """
     runtime_request = self._session_runtime_request_from_body(body)
-    persisted = self._runtime_request_from_persisted_session_lock(session, body)
+    persisted = self._runtime_request_from_persisted_session_lock(
+        session, body, allow_body_model_options=False)
     if not persisted:
         return runtime_request
     requested = runtime_request.get("requested") or {}
@@ -108,9 +109,9 @@ def _effective_run_runtime_request(
         for key in ("model", "provider")
     ):
         raise ValueError("Request conflicts with the session's confirmed model lock")
-    if (
-        runtime_request.get("model_options")
-        and runtime_request.get("model_options") != persisted.get("model_options")
+    if "model_options" in body and (
+        not isinstance(body["model_options"], dict)
+        or body["model_options"] != persisted.get("model_options", {})
     ):
         raise ValueError("Request conflicts with the session's confirmed model lock")
     return persisted
@@ -533,6 +534,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                     runtime_request = _effective_run_runtime_request(self, session=session, body=body)
                 except ValueError as exc:
                     return _json_error(_openai_error, str(exc), code="model_lock_conflict", status=400)
+    if _api_server._coerce_request_bool(body.get("require_model_lock"), default=False):
+        supplied_session_id = body.get("session_id")
+        if not isinstance(supplied_session_id, str) or not supplied_session_id.strip():
+            return _json_error(
+                _openai_error,
+                "require_model_lock requires an existing session_id with a confirmed model lock",
+                code="model_lock_unavailable", status=409)
+        if session is None or not (runtime_request and runtime_request.get("persisted_lock")):
+            return _json_error(
+                _openai_error,
+                "The requested session has no confirmed persisted model lock",
+                code="model_lock_unavailable", status=409)
     lock_active = bool(runtime_request and runtime_request.get("require_model_lock"))
     if lock_active:
         route = runtime_request.get("route")

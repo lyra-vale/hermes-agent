@@ -1828,6 +1828,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return (cls._clean_runtime_id(requested.get("model")),
                 cls._clean_runtime_id(requested.get("provider"), max_len=80))
 
+    def _runtime_route_snapshot(self, runtime_request: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Return the non-secret provider/model identity behind a model-route alias."""
+        if runtime_request.get("route_source") != "model_routes":
+            return None
+        route = runtime_request.get("route") or {}
+        requested = runtime_request.get("requested") or {}
+        model = self._clean_runtime_id(route.get("model") or requested.get("model"))
+        provider = self._clean_runtime_id(
+            route.get("provider") or requested.get("provider"), max_len=80)
+        return {"model": model, "provider": provider}
+
     def _runtime_lock_error(self, runtime_request: Dict[str, Any]) -> Optional["web.Response"]:
         if not runtime_request.get("require_model_lock"):
             return None
@@ -1858,6 +1869,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 session_id, model=model or None, provider=provider or None,
                 model_options=runtime_request.get("model_options") or {},
                 route_source=runtime_request.get("route_source") or "",
+                route_snapshot=self._runtime_route_snapshot(runtime_request),
                 confirmed=bool(runtime_request.get("require_model_lock")))
             return True
         except Exception:
@@ -1875,7 +1887,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return {}
 
     def _runtime_request_from_persisted_session_lock(
-        self, session: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self, session: Optional[Dict[str, Any]], body: Dict[str, Any], *,
+        allow_body_model_options: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         if not isinstance(session, dict):
             return None
         model_config = self._parse_session_model_config(session.get("model_config"))
@@ -1887,13 +1901,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None
         if self._clean_runtime_id(lock.get("route_source"), max_len=64).lower() == "model_routes":
             route = self._resolve_route(model) if model else None
+            snapshot = lock.get("route_snapshot")
+            current_snapshot = self._runtime_route_snapshot({
+                "route_source": "model_routes", "route": route,
+                "requested": {"model": model, "provider": provider}})
+            if not isinstance(snapshot, dict) or current_snapshot != {
+                "model": self._clean_runtime_id(snapshot.get("model")),
+                "provider": self._clean_runtime_id(snapshot.get("provider"), max_len=80),
+            }:
+                route = None
         else:
             route = {"model": model} if model else {}
             if provider:
                 route["provider"] = provider
-        model_options = body.get("model_options")
+        model_options = body.get("model_options") if allow_body_model_options else lock.get("model_options")
         if not isinstance(model_options, dict):
             model_options = lock.get("model_options")
+        if not isinstance(model_options, dict):
+            model_options = {}
         return {
             "requested": {"provider": provider, "model": model, "raw_model": model},
             "route": route or None, "route_source": "session_model_lock",
@@ -2864,6 +2889,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "route_source": runtime_request.get("route_source") or "",
                 "confirmed": bool(runtime_request.get("require_model_lock")),
                 "updated_at": time.time()}}
+            route_snapshot = self._runtime_route_snapshot(runtime_request)
+            if route_snapshot is not None:
+                model_config["browser_model_lock"]["route_snapshot"] = route_snapshot
         title = body.get("title")
 
         def _atomic(conn):

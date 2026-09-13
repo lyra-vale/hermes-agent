@@ -704,7 +704,7 @@ class SessionSessionsMixin:
     def update_session_runtime_lock(
         self, session_id: str, *, model: Optional[str] = None, provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None, route_source: Optional[str] = None,
-        confirmed: bool = False,
+        route_snapshot: Optional[Dict[str, str]] = None, confirmed: bool = False,
     ) -> None:
         """Persist a Browser / API-client runtime lock into model_config (lineage markers survive); null
         system_prompt so cached footers cannot lie."""
@@ -712,6 +712,11 @@ class SessionSessionsMixin:
             "provider": provider or "", "model": model or "", "model_options": model_options or {},
             "route_source": route_source or "", "confirmed": bool(confirmed), "updated_at": time.time(),
         }
+        if isinstance(route_snapshot, dict):
+            lock["route_snapshot"] = {
+                "provider": str(route_snapshot.get("provider") or ""),
+                "model": str(route_snapshot.get("model") or ""),
+            }
         self._write_model_config_patch(
             session_id, {"browser_model_lock": lock},
             """UPDATE sessions SET
