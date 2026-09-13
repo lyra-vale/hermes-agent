@@ -2194,11 +2194,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
         # A request allowlist is always applied after the configured platform
-        # and hosted-room policy. It can only remove capabilities and cannot
-        # be bypassed by model/session selection or by room dispatch.
+        # and hosted-room policy. A derived toolset is accepted only when its
+        # resolved tools are already in that policy's tool universe.
+        # Repeat the subset gate at construction so direct/internal callers
+        # cannot bypass the HTTP validation boundary.
         if requested_toolsets is not None:
-            requested = set(requested_toolsets)
-            enabled_toolsets = [name for name in enabled_toolsets if name in requested]
+            from toolsets import narrow_toolsets
+            enabled_toolsets = narrow_toolsets(requested_toolsets, enabled_toolsets)
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:

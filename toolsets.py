@@ -1,6 +1,6 @@
 """Toolset helpers: get/resolve/validate named tool groups (static TOOLSETS + registry-registered)."""
 
-from typing import Dict, List, Any, Set, Optional, Tuple
+from typing import Dict, List, Any, Set, Optional, Tuple, Iterable
 
 
 # Shared tool list for CLI and all messaging platform toolsets (edit once, all
@@ -121,6 +121,10 @@ TOOLSETS = {
         "File manipulation tools: read, write, patch (with fuzzy matching), and "
         "search (content + files)",
         ["read_file", "write_file", "patch", "search_files"],
+    ),
+    "file_readonly": _ts(
+        "Read-only file inspection tools: read and search (no writes or patches)",
+        ["read_file", "search_files"],
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
@@ -439,6 +443,33 @@ def get_toolset_names() -> List[str]:
 def validate_toolset(name: str) -> bool:
     return (name in {"all", "*"} or name in TOOLSETS
             or name in _get_plugin_toolset_names() or name in _get_registry_toolset_aliases())
+
+
+def resolve_toolset_universe(toolset_names: Optional[Iterable[str]]) -> Set[str]:
+    """Resolve the individual tools granted by a collection of toolset names."""
+    tools: Set[str] = set()
+    for name in toolset_names or []:
+        tools.update(resolve_toolset(name))
+    return tools
+
+
+def narrow_toolsets(requested_toolsets: Iterable[str], available_toolsets: Optional[Iterable[str]]) -> List[str]:
+    """Keep requested toolsets that cannot add tools beyond *available_toolsets*.
+
+    A requested name may be a narrower derived toolset rather than an exact name in
+    the configured list, but every tool it resolves to must already be in the
+    configured tool universe. Unknown names and empty derived toolsets are dropped.
+    """
+    available_names = set(available_toolsets or [])
+    available_tools = resolve_toolset_universe(list(available_names))
+    result: List[str] = []
+    for name in requested_toolsets:
+        if not validate_toolset(name):
+            continue
+        resolved = set(resolve_toolset(name))
+        if resolved <= available_tools and (name in available_names or resolved):
+            result.append(name)
+    return result
 
 
 def create_custom_toolset(name: str, description: str, tools: List[str] = None, includes: List[str] = None) -> None:

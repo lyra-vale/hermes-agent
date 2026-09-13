@@ -56,10 +56,11 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
     """Validate the optional ``POST /v1/runs`` ``toolsets`` narrowing field.
 
     ``None`` means the field was omitted and preserves the configured API-server
-    selection. A list is an exact allowlist of already-enabled, canonically
-    registered toolset names; an empty list therefore creates an agent with no
-    toolsets. Validation is strict so malformed, duplicate, unknown, or
-    unavailable names cannot broaden the selection downstream.
+    selection. A list is an exact allowlist of registered toolset names, or a
+    narrower derived name whose resolved tools are all in the configured
+    tool universe; ``[]`` therefore creates an agent with no toolsets. Validation
+    is strict so malformed, duplicate, unknown, or unavailable names cannot
+    broaden the selection downstream.
     """
     if not isinstance(body, dict) or "toolsets" not in body:
         return None
@@ -67,7 +68,7 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
     if not isinstance(requested, list) or len(requested) > _MAX_RUN_TOOLSET_ENTRIES:
         raise ValueError("toolsets must be an array of at most 64 names")
     available = {str(name) for name in (available_toolsets or ())}
-    from toolsets import validate_toolset
+    from toolsets import narrow_toolsets, validate_toolset
     seen = set()
     result: List[str] = []
     for name in requested:
@@ -82,7 +83,7 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
             raise ValueError("toolsets entries must be unique")
         if not validate_toolset(name):
             raise ValueError("toolsets contains an unknown entry")
-        if name not in available:
+        if name not in narrow_toolsets([name], available):
             raise ValueError("toolsets contains an unavailable entry")
         seen.add(name)
         result.append(name)

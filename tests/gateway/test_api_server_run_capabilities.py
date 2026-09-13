@@ -487,3 +487,34 @@ def test_create_agent_real_import_resolves_selected_tool_definitions():
     empty_names = {tool["function"]["name"] for tool in empty_agent.tools}
     assert web_names == set(resolve_toolset("web"))
     assert empty_names == set()
+
+
+def test_create_agent_real_import_resolves_file_readonly_from_configured_file():
+    adapter = _adapter()
+    runtime = {
+        "api_key": "test-key", "base_url": "http://127.0.0.1:1/v1", "provider": None,
+        "api_mode": "chat_completions", "command": None, "args": [],
+    }
+    config = {"platform_toolsets": {"api_server": ["file"]}}
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value=runtime),
+        patch("gateway.run._resolve_gateway_model", return_value="test/model"),
+        patch("gateway.run._load_gateway_config", return_value=config),
+    ):
+        agent = adapter._create_agent(requested_toolsets=["file_readonly"])
+
+    assert {tool["function"]["name"] for tool in agent.tools} == {"read_file", "search_files"}
+
+
+def test_request_rejects_derived_toolset_when_a_resolved_tool_is_unavailable(monkeypatch):
+    from toolsets import TOOLSETS
+
+    partial_name = "_test_file_readonly_partial"
+    monkeypatch.setitem(
+        TOOLSETS,
+        partial_name,
+        {"description": "Test partial file policy", "tools": ["read_file"], "includes": []},
+    )
+
+    with pytest.raises(ValueError, match="unavailable"):
+        _validate_run_toolsets({"toolsets": ["file_readonly"]}, {partial_name})
