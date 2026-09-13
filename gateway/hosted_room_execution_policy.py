@@ -50,6 +50,10 @@ class RoomExecutionPolicy:
         toolsets = tuple(sorted(_identifier(item, field="enabled_toolset") for item in raw_toolsets))
         if len(set(toolsets)) != len(toolsets) or "bot_room" not in toolsets:
             raise RoomExecutionPolicyError("enabled_toolsets are invalid")
+        if "memory_append" in toolsets:
+            from toolsets import derived_toolset_backing_available
+            if not derived_toolset_backing_available("memory_append", toolsets):
+                raise RoomExecutionPolicyError("memory_append requires memory authority")
         approval_mode = str(value["approval_mode"] or "").strip().lower()
         if approval_mode not in {"manual", "smart", "off"}:
             raise RoomExecutionPolicyError("approval_mode is invalid")

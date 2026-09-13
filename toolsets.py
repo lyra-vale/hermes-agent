@@ -129,6 +129,13 @@ TOOLSETS = {
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    # Derived session capability: external providers may expose recall/query and
+    # append-only fact storage when the backing memory capability is available.
+    # It intentionally has no direct tools; provider injection supplies the
+    # narrowed schemas after the base tool snapshot is built.
+    "memory_append": _ts(
+        "Append-only external memory: recall/query and add facts",
+    ),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
@@ -453,6 +460,22 @@ def resolve_toolset_universe(toolset_names: Optional[Iterable[str]]) -> Set[str]
     return tools
 
 
+# Derived toolsets are accepted only when their backing capability is present in
+# the configured tool universe. Keep this relationship here so API, hosted-room,
+# and agent construction all make the same decision.
+DERIVED_TOOLSET_BACKING = {"memory_append": "memory"}
+
+
+def derived_toolset_backing_available(name: str, available_toolsets: Optional[Iterable[str]]) -> bool:
+    backing = DERIVED_TOOLSET_BACKING.get(name)
+    if backing is None:
+        return True
+    try:
+        return backing in resolve_toolset_universe(available_toolsets)
+    except Exception:
+        return False
+
+
 def narrow_toolsets(requested_toolsets: Iterable[str], available_toolsets: Optional[Iterable[str]]) -> List[str]:
     """Keep requested toolsets that cannot add tools beyond *available_toolsets*.
 
@@ -465,6 +488,10 @@ def narrow_toolsets(requested_toolsets: Iterable[str], available_toolsets: Optio
     result: List[str] = []
     for name in requested_toolsets:
         if not validate_toolset(name):
+            continue
+        if name in DERIVED_TOOLSET_BACKING:
+            if derived_toolset_backing_available(name, available_names):
+                result.append(name)
             continue
         resolved = set(resolve_toolset(name))
         if resolved <= available_tools and (name in available_names or resolved):

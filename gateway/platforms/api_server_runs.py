@@ -68,7 +68,7 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
     if not isinstance(requested, list) or len(requested) > _MAX_RUN_TOOLSET_ENTRIES:
         raise ValueError("toolsets must be an array of at most 64 names")
     available = {str(name) for name in (available_toolsets or ())}
-    from toolsets import narrow_toolsets, validate_toolset
+    from toolsets import derived_toolset_backing_available, narrow_toolsets, validate_toolset
     seen = set()
     result: List[str] = []
     for name in requested:
@@ -83,11 +83,28 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
             raise ValueError("toolsets entries must be unique")
         if not validate_toolset(name):
             raise ValueError("toolsets contains an unknown entry")
+        if not derived_toolset_backing_available(name, available):
+            raise ValueError(f"toolsets entry '{name}' is unavailable without its backing capability")
         if name not in narrow_toolsets([name], available):
             raise ValueError("toolsets contains an unavailable entry")
         seen.add(name)
         result.append(name)
     return result
+
+
+def _resolve_run_file_readonly_roots(self, *, active: bool) -> Optional[tuple[str, ...]]:
+    """Capture server-owned read-only roots for an admitted API run only."""
+    if not active:
+        return None
+    from tools.file_readonly_scope import FileReadonlyPolicyError, resolve_file_readonly_roots
+
+    extra = getattr(getattr(self, "config", None), "extra", None)
+    values = extra.get("file_readonly_roots") if isinstance(extra, dict) else None
+    try:
+        return resolve_file_readonly_roots(values)
+    except FileReadonlyPolicyError as exc:
+        raise ValueError("file_readonly requires at least one valid absolute server-owned root") from exc
+
 
 
 def _effective_run_runtime_request(
@@ -406,6 +423,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    file_readonly_roots: Optional[tuple[str, ...]] = None  # captured server-owned roots for this run
 
     @property
     def approval_session_key(self) -> str:
@@ -478,17 +496,24 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
             if isinstance(body, dict) else (None, None)))
     requested_toolsets = None
+    available_toolsets = None
+    if room_dispatch is not None:
+        try:
+            from gateway.hosted_room_execution_policy import RoomExecutionPolicy
+            available_toolsets = RoomExecutionPolicy.from_mapping(
+                room_execution_policy or {}).enabled_toolsets
+        except ValueError as exc:
+            return _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
+        except Exception:
+            logger.exception("/v1/runs hosted-room toolset resolution failed")
+            return _json_error(_openai_error, "Unable to validate requested toolsets", code="invalid_toolsets", status=400)
     if "toolsets" in body:
         try:
             from hermes_cli.plugins import discover_plugins
             from tools.mcp_tool_discovery import discover_mcp_tools
             discover_plugins()
             discover_mcp_tools()
-            if room_dispatch is not None:
-                from gateway.hosted_room_execution_policy import RoomExecutionPolicy
-                available_toolsets = RoomExecutionPolicy.from_mapping(
-                    room_execution_policy or {}).enabled_toolsets
-            else:
+            if available_toolsets is None:
                 from gateway.run import _load_gateway_config
                 from hermes_cli.tools_config import _get_platform_tools
                 available_toolsets = _get_platform_tools(_load_gateway_config(), "api_server")
@@ -498,6 +523,29 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         except Exception:
             logger.exception("/v1/runs toolset narrowing resolution failed")
             return _json_error(_openai_error, "Unable to validate requested toolsets", code="invalid_toolsets", status=400)
+    # Omitted toolsets preserve the configured API/hosted-room selection. Resolve
+    # that selection only here because file_readonly needs its run-local root
+    # policy; the request body can never provide or expand those roots.
+    if available_toolsets is None:
+        try:
+            if room_dispatch is not None:
+                available_toolsets = ()
+            else:
+                from gateway.run import _load_gateway_config
+                from hermes_cli.tools_config import _get_platform_tools
+                available_toolsets = _get_platform_tools(_load_gateway_config(), "api_server")
+        except Exception:
+            logger.exception("/v1/runs configured toolset resolution failed")
+            return _json_error(_openai_error, "Unable to validate configured toolsets", code="invalid_toolsets", status=400)
+    file_readonly_requested = (
+        "file_readonly" in requested_toolsets if requested_toolsets is not None
+        else "file_readonly" in set(available_toolsets or ())
+    )
+    try:
+        file_readonly_roots = _resolve_run_file_readonly_roots(
+            self, active=file_readonly_requested)
+    except ValueError as exc:
+        return _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
         return _json_error(
@@ -644,7 +692,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        file_readonly_roots=file_readonly_roots)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -667,6 +716,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     # accumulate until the OS refuses new process spawns.
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.file_readonly_scope import bind_file_readonly_roots, reset_file_readonly_roots
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
@@ -697,6 +747,10 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             if run.agent_kwargs["room_dispatch"] is not None:
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
+            if run.file_readonly_roots is not None:
+                # This is deliberately inside the executor thread: ContextVars do
+                # not propagate through run_in_executor automatically.
+                resets.append((bind_file_readonly_roots(run.file_readonly_roots), reset_file_readonly_roots))
             register_gateway_notify(run.approval_session_key, approval_notify)
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.

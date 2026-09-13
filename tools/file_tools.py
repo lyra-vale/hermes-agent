@@ -209,19 +209,47 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return _is_blocked_device_path(resolved)
 
 
+def _file_readonly_scope_bound() -> bool:
+    """Return whether this execution context has a file-readonly policy."""
+    from tools.file_readonly_scope import current_file_readonly_roots
+
+    return current_file_readonly_roots() is not None
+
+
+def _resolve_and_enforce_file_readonly_path(path: str, task_id: str):
+    """Resolve *path* against the task cwd, then apply the run-local policy.
+
+    The returned path keeps the existing resolved-path type when no policy is
+    bound.  A bound policy returns a host ``Path`` at its canonical realpath;
+    any policy or resolution error is allowed to propagate so callers can fail
+    closed before touching file contents or a search backend.
+    """
+    resolved = _resolve_path_for_task(path, task_id)
+    from tools.file_readonly_scope import enforce_file_readonly_path
+
+    canonical = enforce_file_readonly_path(str(resolved))
+    return resolved if canonical is None else Path(canonical)
+
+
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
-    """Remove credential/cache/env paths from a SearchResult in-place; return the omitted count.
+    """Remove credential/cache/env and out-of-scope paths from a SearchResult in-place.
 
     Each path is resolved against the task cwd first (search backends may
-    return cwd-relative paths; the process cwd can differ).
+    return cwd-relative paths; the process cwd can differ).  Under a bound
+    file-readonly policy, a resolution/check failure omits the result instead
+    of falling back to the raw path.
     """
     omitted = 0
+    scope_bound = _file_readonly_scope_bound()
 
     def _allowed(path: str) -> bool:
         nonlocal omitted
         try:
-            target = str(_resolve_path_for_task(path, task_id))
+            target = str(_resolve_and_enforce_file_readonly_path(path, task_id))
         except (OSError, ValueError, RuntimeError):
+            if scope_bound:
+                omitted += 1
+                return False
             target = path
         if get_read_block_error(target):
             omitted += 1
@@ -549,7 +577,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 f"Cannot read '{path}': this is a device file that would "
                 "block or produce infinite output.")
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        _resolved = _resolve_and_enforce_file_readonly_path(path, task_id)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
@@ -948,8 +976,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count)
 
         try:
-            resolved_search_path = str(_resolve_path_for_task(path, task_id))
+            resolved_search_path = str(_resolve_and_enforce_file_readonly_path(path, task_id))
         except (OSError, ValueError, RuntimeError) as exc:
+            # Ordinary searches retain their legacy raw-path fallback when task
+            # resolution fails. A bound read-only policy must never fall back to
+            # an unchecked path.
+            if _file_readonly_scope_bound():
+                raise
             resolved_search_path = path
             # A RuntimeError still surfaces as the tool error unless the raw
             # path is itself denylisted (that error wins).

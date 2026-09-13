@@ -7,6 +7,7 @@ registered at a time (tool-schema bloat, conflicting backends).
 from __future__ import annotations
 
 import contextvars
+import copy
 import inspect
 import json
 import logging
@@ -30,6 +31,18 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+# The external-provider surface is fixed once an agent is constructed.  ``None``
+# is the legacy unrestricted manager mode used by callers that construct a
+# MemoryManager directly rather than through AIAgent.
+_MEMORY_SURFACE_NONE = "none"
+_MEMORY_SURFACE_APPEND = "append"
+_MEMORY_SURFACE_FULL = "full"
+_APPEND_ONLY_FACT_ACTIONS = (
+    "add", "search", "probe", "related", "reason", "contradict", "list",
+)
+_APPEND_ONLY_FACT_ACTION_SET = frozenset(_APPEND_ONLY_FACT_ACTIONS)
+_APPEND_ONLY_REMOVED_PARAMETERS = frozenset({"fact_id", "trust_delta"})
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -82,24 +95,55 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema if name and isinstance(name, str) else None
 
 
-def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]] = None,
-                                  *, memory_tool_present: bool = False) -> bool:
-    """Return whether external memory-provider tools should be exposed."""
-    if disabled_toolsets and "memory" in disabled_toolsets:
-        return False
-    if memory_tool_present or enabled_toolsets is None:
-        return True
-    if not enabled_toolsets:
-        return False
-    if "memory" in enabled_toolsets:
-        return True
+def _toolset_names(value: Optional[List[str]]) -> Optional[set[str]]:
+    """Normalize a toolset collection without treating a malformed scalar as iterable."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {str(value)}
+    try:
+        return {name for name in value if isinstance(name, str)}
+    except TypeError:
+        return set()
+
+
+def _memory_provider_surface(
+    enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]] = None,
+    *, memory_tool_present: bool = False,
+) -> str:
+    """Resolve the immutable external-memory surface for one agent construction."""
+    enabled = _toolset_names(enabled_toolsets)
+    disabled = _toolset_names(disabled_toolsets) or set()
+    if "memory" in disabled:
+        return _MEMORY_SURFACE_NONE
+    # An explicit empty allowlist is a hard no-memory surface, even if a caller
+    # accidentally supplied a stale built-in tool list.
+    if enabled is not None and not enabled:
+        return _MEMORY_SURFACE_NONE
+    if enabled is None:
+        return _MEMORY_SURFACE_FULL
+    if "memory" in enabled:
+        return _MEMORY_SURFACE_FULL
     try:
         from toolsets import resolve_toolset
 
-        return any("memory" in resolve_toolset(name) for name in enabled_toolsets)
+        if any("memory" in resolve_toolset(name) for name in enabled):
+            return _MEMORY_SURFACE_FULL
     except Exception:
         logger.debug("Failed to resolve enabled toolsets for memory-provider tools", exc_info=True)
-        return False
+    if "memory_append" in enabled and "memory_append" not in disabled:
+        return _MEMORY_SURFACE_APPEND
+    if memory_tool_present:
+        return _MEMORY_SURFACE_FULL
+    return _MEMORY_SURFACE_NONE
+
+
+def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]] = None,
+                                  *, memory_tool_present: bool = False) -> bool:
+    """Return whether external memory-provider tools should be exposed."""
+    return _memory_provider_surface(
+        enabled_toolsets, disabled_toolsets, memory_tool_present=memory_tool_present,
+    ) != _MEMORY_SURFACE_NONE
 
 
 def _tool_name(tool: Any) -> Any:
@@ -112,10 +156,67 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     Same gate as ``inject_memory_provider_tools`` so a provider's ``system_prompt_block()``
     never advertises tools absent from the tool surface.
     """
-    tools = getattr(agent, "tools", None)
-    present = isinstance(tools, (list, tuple)) and any(_tool_name(t) == "memory" for t in tools)
-    enabled, disabled = getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
-    return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
+    surface = getattr(agent, "_memory_provider_surface", None)
+    if surface not in {_MEMORY_SURFACE_NONE, _MEMORY_SURFACE_APPEND, _MEMORY_SURFACE_FULL}:
+        tools = getattr(agent, "tools", None)
+        present = isinstance(tools, (list, tuple)) and any(_tool_name(t) == "memory" for t in tools)
+        enabled = getattr(agent, "enabled_toolsets", None)
+        disabled = getattr(agent, "disabled_toolsets", None)
+        surface = _memory_provider_surface(enabled, disabled, memory_tool_present=present)
+        # Keep this decision stable for the rest of the conversation.  In
+        # particular, a later registry refresh must not change the prompt prefix.
+        try:
+            agent._memory_provider_surface = surface
+        except Exception:
+            pass
+    return surface != _MEMORY_SURFACE_NONE
+
+
+def _narrow_append_only_fact_store_schema(schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a copy of ``fact_store`` narrowed to non-destructive actions."""
+    if schema.get("name") != "fact_store":
+        return None
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, dict) or not isinstance(parameters.get("properties"), dict):
+        return None
+    properties = parameters["properties"]
+    action = properties.get("action")
+    if not isinstance(action, dict):
+        return None
+    advertised = action.get("enum")
+    if isinstance(advertised, (list, tuple, set, frozenset)):
+        actions = [name for name in _APPEND_ONLY_FACT_ACTIONS if name in advertised]
+    else:
+        actions = list(_APPEND_ONLY_FACT_ACTIONS)
+    if not actions:
+        return None
+
+    narrowed = copy.deepcopy(schema)
+    narrowed_parameters = narrowed["parameters"]
+    narrowed_properties = narrowed_parameters["properties"]
+    narrowed_properties["action"] = {**narrowed_properties["action"], "enum": actions}
+    for name in _APPEND_ONLY_REMOVED_PARAMETERS:
+        narrowed_properties.pop(name, None)
+    required = narrowed_parameters.get("required")
+    if isinstance(required, list):
+        required = [name for name in required if name not in _APPEND_ONLY_REMOVED_PARAMETERS]
+        if "action" not in required:
+            required.append("action")
+        narrowed_parameters["required"] = required
+
+    # The provider description is model-visible too; remove the known CRUD
+    # advertisement while retaining the provider's useful recall guidance.
+    description = narrowed.get("description")
+    if isinstance(description, str):
+        description = description.replace(
+            "Use alongside the memory tool — memory for always-on context, fact_store for deep recall and compositional queries.",
+            "Use fact_store for deep recall and compositional queries.",
+        ).replace("• update/remove/list — CRUD operations.", "• list — List stored facts.")
+        narrowed["description"] = (
+            f"{description}\n\nAppend-only policy: allowed actions are "
+            f"{', '.join(_APPEND_ONLY_FACT_ACTIONS)}; updates, removals, and fact feedback are unavailable."
+        )
+    return narrowed
 
 
 def inject_memory_provider_tools(agent: Any) -> int:
@@ -125,7 +226,13 @@ def inject_memory_provider_tools(agent: Any) -> int:
     if not memory_manager or tools is None:
         return 0
 
-    if not memory_provider_tools_exposed(agent):
+    memory_provider_tools_exposed(agent)
+    surface = getattr(agent, "_memory_provider_surface", _MEMORY_SURFACE_NONE)
+    configure_surface = getattr(memory_manager, "configure_tool_surface", None)
+    if callable(configure_surface):
+        configure_surface(surface)
+
+    if surface == _MEMORY_SURFACE_NONE:
         # Say so once: a silent 0 leaves the provider looking "half on" with no clue which
         # config key (platform_toolsets / disabled_toolsets) gated it.
         # See #81014.
@@ -133,7 +240,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
                       if getattr(p, "name", "") != "builtin"]
         if _providers:
             logger.info(
-                "Memory provider(s) %s configured but the 'memory' toolset is "
+                "Memory provider(s) %s configured but the memory capability is "
                 "gated off for this session (platform_toolsets / "
                 "agent.disabled_toolsets) — provider tools and system-prompt "
                 "block are both withheld.",
@@ -156,6 +263,16 @@ def inject_memory_provider_tools(agent: Any) -> int:
                 "Memory provider returned a tool schema with no resolvable "
                 "name; skipping to avoid poisoning the request (%r)", raw_schema,
             )
+        elif surface == _MEMORY_SURFACE_APPEND:
+            schema = _narrow_append_only_fact_store_schema(schema)
+            if schema is None:
+                continue
+            if schema["name"] in existing_tool_names:
+                continue
+            tools.append({"type": "function", "function": schema})
+            agent.valid_tool_names.add(schema["name"])
+            existing_tool_names.add(schema["name"])
+            added += 1
         elif schema["name"] not in existing_tool_names:
             tools.append({"type": "function", "function": schema})
             agent.valid_tool_names.add(schema["name"])
@@ -296,6 +413,9 @@ class MemoryManager:
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
+        # Direct MemoryManager users retain the historical unrestricted surface
+        # until an AIAgent construction explicitly configures one.
+        self._tool_surface: Optional[str] = None
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
         timeout = external_prefetch_timeout
@@ -316,6 +436,22 @@ class MemoryManager:
         self._shutdown_drain_state: Dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
+
+    @property
+    def _effective_tool_surface(self) -> str:
+        return self._tool_surface or _MEMORY_SURFACE_FULL
+
+    def configure_tool_surface(self, surface: str) -> None:
+        """Freeze the provider surface selected during AIAgent construction."""
+        if surface not in {_MEMORY_SURFACE_NONE, _MEMORY_SURFACE_APPEND, _MEMORY_SURFACE_FULL}:
+            raise ValueError(f"Unknown memory provider surface: {surface}")
+        if self._tool_surface is None:
+            self._tool_surface = surface
+        elif self._tool_surface != surface:
+            logger.warning(
+                "Ignoring memory provider surface change from %s to %s after agent construction",
+                self._tool_surface, surface,
+            )
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[List[MemoryProvider]] = None, exc_info: bool = False) -> List[Any]:
@@ -389,6 +525,8 @@ class MemoryManager:
 
     def build_system_prompt(self) -> str:
         """Join every provider's non-empty ``system_prompt_block()`` with blank lines."""
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            return ""
         blocks = self._each_provider("system_prompt_block() failed", lambda p: p.system_prompt_block(),
                                       level=logging.WARNING)
         return "\n\n".join(b for b in blocks if b and b.strip())
@@ -399,6 +537,8 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -456,6 +596,8 @@ class MemoryManager:
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
         Call right after :meth:`prefetch_all` so the user SEES memory was used even if the model is silent."""
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            return ""
         segments: List[str] = []
         for status in self._each_provider("recall_status failed (non-fatal)", lambda p: p.recall_status()):
             if status is None:
@@ -468,6 +610,8 @@ class MemoryManager:
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            return
         providers = list(self._providers)
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
@@ -595,6 +739,26 @@ class MemoryManager:
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
+        surface = self._effective_tool_surface
+        if surface == _MEMORY_SURFACE_NONE:
+            return tool_error(f"Memory provider tool '{tool_name}' is not available in this session")
+        if surface == _MEMORY_SURFACE_APPEND:
+            if tool_name != "fact_store":
+                return tool_error(
+                    f"Memory provider tool '{tool_name}' is not available on the append-only memory surface",
+                )
+            if not isinstance(args, dict):
+                return tool_error("fact_store arguments must be an object on the append-only memory surface")
+            action = args.get("action")
+            if not isinstance(action, str) or action not in _APPEND_ONLY_FACT_ACTION_SET:
+                return tool_error(
+                    "fact_store action is not available on the append-only memory surface",
+                )
+            forbidden = sorted(_APPEND_ONLY_REMOVED_PARAMETERS.intersection(args))
+            if forbidden:
+                return tool_error(
+                    f"fact_store parameters are not available on the append-only memory surface: {', '.join(forbidden)}",
+                )
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
@@ -674,6 +838,8 @@ class MemoryManager:
 
     def supports_pre_compress_checkpoint(self, api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION) -> bool:
         """Return whether an active provider guarantees checkpoint API support."""
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            return False
         versions = (self._checkpoint_api_version(p) for p in self._providers)
         return any(v is not None and v >= api_version for v in versions)
 
@@ -686,6 +852,10 @@ class MemoryManager:
         only to checkpoint (v2+) providers. With ``require_checkpoint`` at least one checkpoint provider
         must succeed — its exception propagates so the caller keeps the uncompressed transcript.
         """
+        if self._effective_tool_surface == _MEMORY_SURFACE_NONE:
+            if require_checkpoint:
+                raise RuntimeError("Memory provider is not exposed in this session")
+            return ""
         parts = []
         checkpoint_succeeded = False
         for provider in self._providers:
