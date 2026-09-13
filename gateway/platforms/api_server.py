@@ -1905,18 +1905,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _effective_session_runtime_request(
         self, *, session: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Dict[str, Any]:
         runtime_request = self._session_runtime_request_from_body(body)
-        persisted = self._runtime_request_from_persisted_session_lock(session, body)
-        if persisted:
-            requested = runtime_request.get("requested") or {}
-            locked = persisted.get("requested") or {}
-            if any(requested.get(key) and requested.get(key) != locked.get(key)
-                   for key in ("model", "provider")):
-                raise ValueError("Request conflicts with the session's confirmed model lock")
-            if (runtime_request.get("model_options")
-                    and runtime_request.get("model_options") != persisted.get("model_options")):
-                raise ValueError("Request conflicts with the session's confirmed model lock")
-            return persisted
-        return runtime_request
+        requested = runtime_request.get("requested") or {}
+        if requested.get("model") or requested.get("provider"):
+            return runtime_request
+        return self._runtime_request_from_persisted_session_lock(session, body) or runtime_request
 
     @classmethod
     def _sanitize_runtime_metadata(

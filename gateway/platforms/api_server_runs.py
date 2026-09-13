@@ -88,6 +88,34 @@ def _validate_run_toolsets(body: Any, available_toolsets: Any) -> Optional[List[
     return result
 
 
+def _effective_run_runtime_request(
+    self, *, session: Optional[Dict[str, Any]], body: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Resolve a run's runtime while enforcing a confirmed session lock.
+
+    Session chat intentionally permits explicit one-turn overrides. Runs are a
+    separate contract: once a session has a confirmed lock, every supplied
+    runtime field must agree with it and the locked request is authoritative.
+    """
+    runtime_request = self._session_runtime_request_from_body(body)
+    persisted = self._runtime_request_from_persisted_session_lock(session, body)
+    if not persisted:
+        return runtime_request
+    requested = runtime_request.get("requested") or {}
+    locked = persisted.get("requested") or {}
+    if any(
+        requested.get(key) and requested.get(key) != locked.get(key)
+        for key in ("model", "provider")
+    ):
+        raise ValueError("Request conflicts with the session's confirmed model lock")
+    if (
+        runtime_request.get("model_options")
+        and runtime_request.get("model_options") != persisted.get("model_options")
+    ):
+        raise ValueError("Request conflicts with the session's confirmed model lock")
+    return persisted
+
+
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
@@ -502,7 +530,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             session = await asyncio.to_thread(db.get_session, str(session_id))
             if session:
                 try:
-                    runtime_request = self._effective_session_runtime_request(session=session, body=body)
+                    runtime_request = _effective_run_runtime_request(self, session=session, body=body)
                 except ValueError as exc:
                     return _json_error(_openai_error, str(exc), code="model_lock_conflict", status=400)
     lock_active = bool(runtime_request and runtime_request.get("require_model_lock"))
