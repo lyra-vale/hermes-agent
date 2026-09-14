@@ -2266,6 +2266,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "provider": actual_provider or runtime_kwargs.get("provider") or "",
                 "model": actual_model or model,
                 "route_source": route_source},
+            runtime_options=self._runtime_options_from_model_options(model_options),
             route_source=route_source,
             model_lock=("confirmed" if confirmed_runtime_lock else ""))
         return agent

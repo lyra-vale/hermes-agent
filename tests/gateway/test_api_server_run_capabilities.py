@@ -458,13 +458,15 @@ def test_confirmed_lock_disables_fallback_and_reports_locked_runtime():
         agent = adapter._create_agent(
             requested_model="locked/model", requested_provider="openrouter",
             route={"model": "locked/model", "provider": "openrouter"},
+            model_options={"reasoning": {"enabled": True, "effort": "low"}},
             confirmed_runtime_lock=True)
 
     assert agent is not None
     assert agent_cls.call_args.kwargs["fallback_model"] is None
     assert agent._hermes_api_runtime == {
         "provider": "openrouter", "model": "locked/model",
-        "route_source": "session_model_lock", "model_lock": "confirmed"}
+        "route_source": "session_model_lock", "model_lock": "confirmed",
+        "model_options": {"reasoning": {"enabled": True, "effort": "low"}}}
 
 
 def test_create_agent_real_import_resolves_selected_tool_definitions():
