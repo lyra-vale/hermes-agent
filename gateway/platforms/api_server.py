@@ -1796,6 +1796,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_options["service_tier"] = "priority"
         return runtime_options
 
+    @classmethod
+    def _sanitize_runtime_model_options(cls, runtime_options: Any) -> Dict[str, Any]:
+        if not isinstance(runtime_options, dict):
+            return {}
+        reasoning = runtime_options.get("reasoning_config")
+        if not isinstance(reasoning, dict):
+            return {}
+        enabled = reasoning.get("enabled")
+        if not isinstance(enabled, bool):
+            return {}
+        sanitized_reasoning: Dict[str, Any] = {"enabled": enabled}
+        effort = cls._clean_runtime_id(reasoning.get("effort"), max_len=32)
+        if effort:
+            sanitized_reasoning["effort"] = effort
+        return {"reasoning": sanitized_reasoning}
+
     def _session_runtime_request_from_body(
         self, body: Dict[str, Any], *, canonicalize_options: bool = False
     ) -> Dict[str, Any]:
@@ -1950,6 +1966,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @classmethod
     def _sanitize_runtime_metadata(
         cls, *, runtime: Optional[Dict[str, Any]] = None, requested_runtime: Optional[Dict[str, Any]] = None,
+        runtime_options: Optional[Dict[str, Any]] = None,
         route_source: str = "global", model_lock: str = "") -> Dict[str, Any]:
         payload = dict(runtime or {})
         provider = cls._clean_runtime_id(
@@ -1964,6 +1981,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             result["requested"] = {"provider": provider, "model": model}
         if model_lock or payload.get("model_lock"):
             result["model_lock"] = cls._clean_runtime_id(model_lock or payload.get("model_lock"), max_len=32)
+            sanitized_model_options = cls._sanitize_runtime_model_options(runtime_options)
+            if sanitized_model_options:
+                result["model_options"] = sanitized_model_options
         return result
 
     @staticmethod
@@ -3381,6 +3401,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "model": route.get("model") or requested.get("model") or "",
                 "route_source": runtime_request.get("route_source") or "raw_request"},
             requested_runtime=requested,
+            runtime_options=runtime_request.get("runtime_options"),
             route_source=runtime_request.get("route_source") or "raw_request",
             model_lock="accepted")
         return web.json_response(

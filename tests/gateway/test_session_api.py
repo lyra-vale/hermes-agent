@@ -701,9 +701,17 @@ async def test_session_model_lock_endpoint_then_chat_reuses_persisted_lock_and_p
                     "provider": "nous",
                     "model": "x-ai/grok-4.5",
                     "require_model_lock": True,
+                    "model_options": {
+                        "reasoning": {"enabled": True, "effort": "low"},
+                        "service_tier": "priority",
+                    },
                 },
             )
             assert lock_resp.status == 200, await lock_resp.text()
+            lock_payload = await lock_resp.json()
+            assert lock_payload["runtime"]["model_options"] == {
+                "reasoning": {"enabled": True, "effort": "low"},
+            }
 
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat",
