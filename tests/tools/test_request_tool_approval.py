@@ -39,6 +39,19 @@ def _isolate_approval_state(monkeypatch):
 
 
 class TestRequestToolApproval:
+    def test_api_server_requires_a_registered_run_notifier_before_it_is_approvable(self, monkeypatch):
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "api-run")
+        monkeypatch.setattr(tools_approval_context, "get_current_session_key", lambda default="": "api-run")
+        monkeypatch.setattr(tools_approval_context, "_is_cron_approval_context", lambda: False)
+        monkeypatch.setattr(tools_approval_context, "_get_session_platform", lambda: "api_server")
+
+        assert tools_approval_context._is_gateway_approval_context() is False
+        approval.register_gateway_notify("api-run", lambda _event: None)
+        try:
+            assert tools_approval_context._is_gateway_approval_context() is True
+        finally:
+            approval.unregister_gateway_notify("api-run")
+
     def test_session_cached_approval_short_circuits(self, monkeypatch):
         monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
         # Should NOT prompt at all.

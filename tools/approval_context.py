@@ -169,8 +169,20 @@ def _is_gateway_approval_context() -> bool:
     human who can resolve it (#37284, 87509). Their dangerous-command handling is governed by
     ``approvals.unattended_mode`` config (default deny), mirroring cron.
     """
-    if _is_cron_approval_context() or _is_unattended_platform_approval_context():
+    if _is_cron_approval_context():
         return False
+    if _is_unattended_platform_approval_context():
+        # /v1/runs registers a per-run notifier before executing the agent and
+        # exposes a scoped approval endpoint. It is therefore the one API
+        # surface with a human-resolvable approval round-trip; all other
+        # programmatic platforms remain unattended and fail closed.
+        if _get_session_platform() != "api_server":
+            return False
+        try:
+            from tools.approval import _gateway_notify_cb
+            return _gateway_notify_cb(get_current_session_key(default="")) is not None
+        except Exception:
+            return False
     return env_var_enabled("HERMES_GATEWAY_SESSION") or bool(_get_session_platform())
 
 
