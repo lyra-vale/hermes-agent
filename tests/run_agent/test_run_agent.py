@@ -1696,6 +1696,7 @@ class TestExecuteToolCalls:
 
         agent._memory_manager = FakeMemoryManager()
         agent._memory_store = object()
+        agent.valid_tool_names.add("memory")
 
         with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
@@ -2242,6 +2243,7 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
         agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress.append((event, name, preview, args))
+        agent.valid_tool_names.add("browser_type")
 
         with patch("model_tools.handle_function_call", return_value='{"success": true, "typed": "sk-pro...EFGH"}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
@@ -2279,6 +2281,7 @@ class TestConcurrentToolExecution:
         agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
             side_effect=AssertionError("checkpoint should not run")
         )
+        agent.valid_tool_names.add("write_file")
 
         starts = []
         agent.tool_start_callback = lambda *a: starts.append(a)
@@ -2397,6 +2400,7 @@ class TestConcurrentToolExecution:
             return result, args
 
         monkeypatch.setattr(relay_tools, "execute", invoke_twice)
+        agent.valid_tool_names.add("terminal")
 
         outcome = tool_executor._run_agent_tool_execution_middleware(
             agent,
@@ -2460,6 +2464,7 @@ class TestConcurrentToolExecution:
             return results[0], args
 
         monkeypatch.setattr(relay_tools, "execute", invoke_concurrently)
+        agent.valid_tool_names.add("terminal")
 
         outcome = tool_executor._run_agent_tool_execution_middleware(
             agent,

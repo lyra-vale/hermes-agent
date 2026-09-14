@@ -27,6 +27,60 @@ logger = logging.getLogger(__name__)
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections"})
 
+
+_SCOPE_UNSET = object()
+_TOOL_UNAVAILABLE_MESSAGE = "Tool unavailable in this session."
+
+
+def canonical_tool_name(tool_name: str) -> str:
+    """Return the canonical dispatch name used by model-visible tool schemas."""
+    try:
+        from model_tools import _LEGACY_TOOL_ALIASES
+    except Exception:
+        # Keep this helper usable while model_tools is still importing.
+        _LEGACY_TOOL_ALIASES = {
+            "todo": "todo_list", "cronjob": "cronjob_manage", "process": "process_manage",
+            "tour": "gui_tour", "tip": "show_tip",
+        }
+    return _LEGACY_TOOL_ALIASES.get(tool_name, tool_name)
+
+
+def _session_tool_scope_block(agent, function_name: str) -> Optional[str]:
+    """Return a generic block message when *function_name* is outside the agent surface.
+
+    ``valid_tool_names`` is the resolved visible surface for a normal ``AIAgent``. Bare
+    legacy test doubles may not have that attribute, or may leave it as ``None``; those
+    retain the historical unrestricted behavior. An explicit empty collection denies all
+    names. Deferred tools are admitted only through the current session-scoped catalog.
+    """
+    valid_tool_names = getattr(agent, "valid_tool_names", _SCOPE_UNSET)
+    if valid_tool_names is _SCOPE_UNSET or valid_tool_names is None:
+        return None
+    if isinstance(valid_tool_names, str):
+        valid_tool_names = (valid_tool_names,)
+    try:
+        visible_names = {
+            canonical_tool_name(name)
+            for name in valid_tool_names
+            if isinstance(name, str)
+        }
+    except TypeError:
+        visible_names = set()
+    canonical_name = canonical_tool_name(function_name)
+    if canonical_name in visible_names:
+        return None
+    # An explicit empty set is an intentional deny-all surface, not an invitation to
+    # recover the process-wide deferred catalog.
+    if visible_names:
+        try:
+            from agent.tool_executor import _tool_search_scoped_names
+            deferred_names = _tool_search_scoped_names(agent)
+        except Exception:
+            deferred_names = frozenset()
+        if canonical_name in {canonical_tool_name(name) for name in deferred_names}:
+            return None
+    return _TOOL_UNAVAILABLE_MESSAGE
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "connectors__execute",  # pure remote batches have per-dispatch idempotency keys

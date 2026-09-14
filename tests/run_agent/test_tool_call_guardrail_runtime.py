@@ -375,6 +375,84 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
+@pytest.mark.parametrize(
+    ("dispatch_path", "hidden_name", "arguments", "handler_path"),
+    [
+        ("sequential", "memory", {"action": "remove", "old_text": "secret"}, "tools.memory_tool.memory_tool"),
+        ("concurrent", "terminal", {"command": "printf hidden"}, "model_tools.registry.dispatch"),
+        ("sequential", "provider_hidden", {}, "model_tools.registry.dispatch"),
+        ("direct", "memory", {"action": "remove", "old_text": "secret"}, "tools.memory_tool.memory_tool"),
+    ],
+)
+def test_hidden_tool_is_blocked_before_any_handler_and_keeps_metadata(
+    dispatch_path, hidden_name, arguments, handler_path, monkeypatch
+):
+    agent = _make_agent("fact_store", "read_file", "search_files")
+    memory_manager = MagicMock()
+    agent._memory_manager = memory_manager
+    if hidden_name == "provider_hidden":
+        memory_manager.has_tool.return_value = True
+    agent._flush_messages_to_session_db = lambda messages: True
+    post_calls = []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **kwargs: post_calls.append((hook_name, kwargs)) or [],
+    )
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: kind == "tool_request")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_middleware",
+        lambda kind, **kwargs: [{"args": dict(kwargs["args"]), "source": "scope-test"}]
+        if kind == "tool_request" else [],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: SimpleNamespace(_middleware={}),
+    )
+    execution_names = []
+
+    def _execution_middleware(function_name, args, next_call, **kwargs):
+        execution_names.append(function_name)
+        return next_call(args)
+
+    monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", _execution_middleware)
+
+    with patch(handler_path, return_value="SHOULD_NOT_RUN") as handler:
+        if dispatch_path == "direct":
+            from agent.agent_runtime_helpers import invoke_tool
+
+            result = invoke_tool(
+                agent, hidden_name, arguments, "task-1", tool_call_id="c-hidden",
+                pre_tool_block_checked=True,
+            )
+            result_content = result
+        else:
+            tool_call = _mock_tool_call(hidden_name, json.dumps(arguments), "c-hidden")
+            message = SimpleNamespace(content="", tool_calls=[tool_call])
+            messages = []
+            runner = (
+                agent._execute_tool_calls_sequential
+                if dispatch_path == "sequential"
+                else agent._execute_tool_calls_concurrent
+            )
+            runner(message, messages, "task-1")
+            assert [item["role"] for item in messages] == ["tool"]
+            assert [item["tool_call_id"] for item in messages] == ["c-hidden"]
+            result_content = messages[0]["content"]
+
+    handler.assert_not_called()
+    assert execution_names == [hidden_name]
+    assert agent._memory_manager.mock_calls == []
+    assert "unavailable in this session" in result_content.lower()
+    assert hidden_name not in result_content
+    [(_, post_call)] = [item for item in post_calls if item[1]["tool_call_id"] == "c-hidden"]
+    assert post_call["status"] == "blocked"
+    assert post_call["error_type"] == "tool_scope_block"
+    assert post_call["middleware_trace"] == [{"source": "scope-test"}]
+
+
 def test_default_run_conversation_warns_without_guardrail_halt():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}

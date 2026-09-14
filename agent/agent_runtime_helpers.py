@@ -2235,8 +2235,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )
+    from agent.tool_dispatch_helpers import _session_tool_scope_block, canonical_tool_name
     if not isinstance(function_args, dict):
         function_args = {}
+    function_name = canonical_tool_name(function_name)
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
@@ -2262,13 +2264,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
         return result
     tool_start_time = time.monotonic()
-    inline_executor = resolve_invoke_tool_executor(agent, function_name)
-    if inline_executor is not None:
-        inline_ctx = InlineToolContext(
-            effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
-        )
 
-        def _execute(next_args: dict) -> Any:
+    def _execute(next_args: dict) -> Any:
+        inline_executor = resolve_invoke_tool_executor(agent, function_name)
+        if inline_executor is not None:
+            inline_ctx = InlineToolContext(
+                effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
+            )
             result = inline_executor(agent, next_args, inline_ctx)
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,
@@ -2278,28 +2280,43 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 middleware_trace=_tool_middleware_trace,
             )
             return result
-    else:
-        def _execute(next_args: dict) -> Any:
-            dispatch_kwargs = dict(
-                tool_call_id=tool_call_id, session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                tool_request_middleware_trace=list(_tool_middleware_trace),
+
+        valid_tool_names = getattr(agent, "valid_tool_names", None)
+        dispatch_kwargs: Dict[str, Any] = dict(
+            tool_call_id=tool_call_id, session_id=agent.session_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            enabled_tools=list(valid_tool_names) if valid_tool_names is not None else None,
+            skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            tool_request_middleware_trace=list(_tool_middleware_trace),
+        )
+        if skip_tool_execution_middleware:
+            dispatch_kwargs["skip_tool_execution_middleware"] = True
+        import model_tools
+        return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+
+    def _scope_checked_execute(next_args: dict) -> Any:
+        effective_args = next_args if isinstance(next_args, dict) else function_args
+        scope_block = _session_tool_scope_block(agent, function_name)
+        if scope_block is not None:
+            result = json.dumps({"error": scope_block}, ensure_ascii=False)
+            emit_terminal_post_tool_call(
+                agent, function_name=function_name, function_args=effective_args, result=result,
+                effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
+                error_type="tool_scope_block", error_message=scope_block,
+                middleware_trace=_tool_middleware_trace,
             )
-            if skip_tool_execution_middleware:
-                dispatch_kwargs["skip_tool_execution_middleware"] = True
-            import model_tools
-            return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+            return result
+        return _execute(effective_args)
+
     if skip_tool_execution_middleware:
-        return _execute(function_args)
+        return _scope_checked_execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware
     return run_tool_execution_middleware(
         function_name, function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        lambda next_args: _scope_checked_execute(next_args if isinstance(next_args, dict) else function_args),
         original_args=function_args, **hook_ids,
     )
 

@@ -43,6 +43,9 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
+    _session_tool_scope_block,
+    _TOOL_UNAVAILABLE_MESSAGE,
+    canonical_tool_name,
     make_tool_result_message,
 )
 from tools.terminal_tool_lifecycle import get_active_env
@@ -363,9 +366,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
 def _canonical_tool_name(function_name: str) -> str:
     """Map legacy tool-name aliases BEFORE agent-loop dispatch."""
-    from model_tools import _LEGACY_TOOL_ALIASES as _lta
-
-    return _lta.get(function_name, function_name)
+    return canonical_tool_name(function_name)
 
 
 def _unwrap_tool_search_call(
@@ -395,7 +396,7 @@ def _unwrap_tool_search_call(
             return function_name, function_args, None
         if underlying not in _tool_search_scoped_names(agent):
             return function_name, function_args, (
-                f"'{underlying}' is not available in this session. Use tool_search to find tools you can call."
+                f"{_TOOL_UNAVAILABLE_MESSAGE} Use tool_search to find tools you can call."
             )
         # Validate before unwrapping: the generic bridge hides the concrete
         # parameter schema from provider-native tool-call validation.
@@ -659,6 +660,7 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
+    scope_block = scope_block or _session_tool_scope_block(agent, ref.name)
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
@@ -1533,6 +1535,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         import model_tools
 
         with model_tools.suppress_post_tool_call_hook():
+            valid_tool_names = getattr(agent, "valid_tool_names", None)
             return model_tools.handle_function_call(
                 function_name,
                 next_args,
@@ -1541,7 +1544,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                enabled_tools=list(valid_tool_names) if valid_tool_names is not None else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 skip_tool_execution_middleware=True,
@@ -1690,10 +1693,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             continue
 
         tool_start_time = time.time()
-        dispatch = _resolve_sequential_dispatch(agent, ref, messages)
+        early_scope_block = pc.scope_block or _session_tool_scope_block(agent, ref.name)
+        if early_scope_block is not None:
+            # Do not resolve inline, memory-manager, context-engine, delegate, or registry
+            # handlers for a name outside the final session surface. The middleware runner
+            # still owns the terminal blocked result and its trace.
+            dispatch = _SequentialDispatch(execute=lambda _args: None, middleware_trace_arg=ref.trace)
+        else:
+            dispatch = _resolve_sequential_dispatch(agent, ref, messages)
         managed, tool_duration = _run_sequential_call(
             agent, dispatch, ref,
-            scope_block=pc.scope_block,
+            scope_block=early_scope_block,
             messages=messages,
             remaining_calls=tool_calls[i - 1:],
             display_index=i,
