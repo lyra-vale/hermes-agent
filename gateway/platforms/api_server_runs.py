@@ -424,6 +424,7 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     file_readonly_roots: Optional[tuple[str, ...]] = None  # captured server-owned roots for this run
+    memory_append_receipt: Any = None  # validated, handler-bound expected facts; never sent to the model
 
     @property
     def approval_session_key(self) -> str:
@@ -541,6 +542,38 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         "file_readonly" in requested_toolsets if requested_toolsets is not None
         else "file_readonly" in set(available_toolsets or ())
     )
+    memory_append_receipt = None
+    if "memory_append_receipt" in body:
+        # Receipt mode is intentionally narrower than an ordinary memory run: no
+        # other tools, room dispatch, caller instructions, or transcript chain.
+        # The provider handler remains the only memory write path.
+        if requested_toolsets != ["memory_append"] or room_dispatch is not None or self._room_grant_token(request):
+            return _json_error(
+                _openai_error, "memory append receipt requires exactly the memory_append toolset",
+                code="invalid_memory_append_receipt", status=400)
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if not idempotency_key or not self._run_idempotency_store.durable:
+            return _json_error(
+                _openai_error, "memory append receipt requires durable idempotency",
+                code="memory_append_receipt_unavailable", status=409)
+        disallowed = {"instructions", "conversation_history", "previous_response_id", "model", "provider", "model_options"}.intersection(body)
+        if (gateway_session_key is not None or not isinstance(body.get("session_id"), str)
+            or not _api_server._coerce_request_bool(body.get("require_model_lock"), default=False)
+            or disallowed):
+            return _json_error(
+                _openai_error, "memory append receipt does not accept caller transcript context",
+                code="invalid_memory_append_receipt", status=400)
+        try:
+            from agent.memory_append_receipt import parse_memory_append_receipt
+            memory_append_receipt = parse_memory_append_receipt(body["memory_append_receipt"])
+        except ValueError:
+            return _json_error(
+                _openai_error, "memory append receipt is invalid", code="invalid_memory_append_receipt", status=400)
+    effective_toolsets = requested_toolsets if requested_toolsets is not None else list(available_toolsets or ())
+    if "memory_append" in effective_toolsets and memory_append_receipt is None:
+        return _json_error(
+            _openai_error, "memory_append is available only through a receipt-bound run",
+            code="invalid_memory_append_receipt", status=400)
     try:
         file_readonly_roots = _resolve_run_file_readonly_roots(
             self, active=file_readonly_requested)
@@ -554,8 +587,14 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     idempotency_scope = idempotency_fingerprint = ""
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
+        fingerprint_body = dict(body)
+        # A receipt retry may need a fresh model-locked session after Voice crashes.
+        # Its durable write identity is the exact approved receipt, not that temporary
+        # executor session. Ordinary runs retain their full-body idempotency contract.
+        if memory_append_receipt is not None:
+            fingerprint_body.pop("session_id", None)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
-            {"body": body, "gateway_session_key": gateway_session_key or ""},
+            {"body": fingerprint_body, "gateway_session_key": gateway_session_key or ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
     raw_input = body.get("input")
@@ -567,6 +606,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
     if not user_message:
         return _json_error(_openai_error, "No user message found in input", status=400)
+    if memory_append_receipt is not None:
+        # Replace caller text with a stable marker before any SessionDB path. The
+        # bounded approved facts travel only in the server-owned ephemeral prompt.
+        if not isinstance(raw_input, str) or raw_input != "Record approved durable facts.":
+            return _json_error(
+                _openai_error, "memory append receipt requires its canonical input",
+                code="invalid_memory_append_receipt", status=400)
+        # Fact content bypasses the model entirely and is never placed in the
+        # agent prompt/session history; the provider receives it below.
     try:
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
@@ -575,6 +623,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
     if history_err is not None:
         return history_err
+    if memory_append_receipt is not None:
+        # A locked session is authentication/routing only for receipt runs. Never
+        # hydrate its SessionDB history or bind a caller-supplied conversation.
+        conversation_history, stored_session_id = [], None
     # Replay the admitted run before reading mutable session locks or model routes. A route alias may
     # disappear after admission; it must not invalidate an exact retry of that already-owned run.
     if idempotency_key:
@@ -639,13 +691,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
-    _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        self._declared_conversation_session(gateway_session_key) if _declared_selected else None)
+    _declared_selected = False if memory_append_receipt is not None else (not session_id and bool(gateway_session_key))
+    selected_session_id = session_id if memory_append_receipt is not None else (session_id or (
+        self._declared_conversation_session(gateway_session_key) if _declared_selected else None))
     # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
     # history loads from it, the turn writes to it, and a detached delivery row persisted to it
     # is what the next same-id run consumes below.
-    if selected_session_id:
+    if selected_session_id and memory_append_receipt is None:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
@@ -656,8 +708,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # nothing persisted to load yet.  Wake authority is fixed here, before the load can
     # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
     # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
-    session_history_delivery = not previous_response_id and not conversation_history
-    if not conversation_history and selected_session_id and not previous_response_id:
+    session_history_delivery = memory_append_receipt is None and not previous_response_id and not conversation_history
+    if memory_append_receipt is None and not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
     q = self._run_streams[run_id] = asyncio.Queue()
     created_at = self._run_streams_created[run_id] = time.time()
@@ -693,7 +745,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author,
-        file_readonly_roots=file_readonly_roots)
+        file_readonly_roots=file_readonly_roots,
+        memory_append_receipt=memory_append_receipt)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -723,6 +776,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     resets: list[tuple[Any, Callable]] = []
     with self._profile_scope(run.request_profile):
         try:
+            if run.memory_append_receipt is not None:
+                from agent.memory_append_receipt import bind_memory_append_receipt, reset_memory_append_receipt
+                resets.append((bind_memory_append_receipt(run.memory_append_receipt), reset_memory_append_receipt))
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
             # chat_id carries the raw session id like _run_agent() does; without it
@@ -828,12 +884,39 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
+        if run.memory_append_receipt is not None:
+            manager = getattr(agent, "_memory_manager", None)
+            provider = getattr(manager, "receipt_append_provider", lambda: None)()
+            if provider is None:
+                _finish("failed", error="Memory append receipt provider is unavailable")
+                return
         raw_runtime_metadata = getattr(agent, "_hermes_api_runtime", None)
         runtime_metadata = None
         if isinstance(raw_runtime_metadata, dict):
             runtime_metadata = dict(raw_runtime_metadata)
             self._set_run_status(
                 run_id, "running", model=runtime_metadata.get("model"), runtime=runtime_metadata)
+        if run.memory_append_receipt is not None:
+            # Receipt persistence is a provider-owned SQLite transaction, never
+            # an LLM turn. This makes a restart recoverable from the receipt ledger.
+            try:
+                receipt_provider = getattr(getattr(agent, "_memory_manager", None), "receipt_append_provider")()
+                persisted = await loop.run_in_executor(
+                    None, lambda: receipt_provider.append_receipt(
+                        run.memory_append_receipt.reset_id, run.memory_append_receipt.provider_facts()))
+                receipt = run.memory_append_receipt.receipt_from_provider(
+                    persisted, run_id=run_id, session_id=run.session_id,
+                    provider=getattr(receipt_provider, "name", ""),
+                )
+            except Exception:
+                logger.exception("[api_server] memory append receipt transaction failed")
+                _finish("failed", error="Memory append receipt was not verified")
+                return
+            extra = {"memory_append_receipt": receipt}
+            if runtime_metadata is not None:
+                extra["runtime"] = runtime_metadata
+            _finish("completed", extra, output="", usage={key: 0 for key, _attr in _USAGE_FIELDS})
+            return
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
@@ -849,7 +932,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
             if runtime_metadata is not None:
                 extra["runtime"] = runtime_metadata
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            if run.memory_append_receipt is not None:
+                try:
+                    provider = getattr(getattr(agent, "_memory_manager", None), "receipt_append_provider")()
+                    extra["memory_append_receipt"] = run.memory_append_receipt.receipt(
+                        run_id=run_id, session_id=run.session_id, provider=getattr(provider, "name", ""),
+                    )
+                except ValueError:
+                    _finish("failed", error="Memory append receipt was not verified")
+                    return
+                # A receipt-bearing caller must decide from the handler-verified
+                # proof, never model prose claiming that a write occurred.
+                _finish("completed", extra, output="", usage=usage)
+            else:
+                _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")
         raise

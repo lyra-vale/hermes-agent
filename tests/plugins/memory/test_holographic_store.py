@@ -207,6 +207,43 @@ class TestConcurrency:
             sibling.close()
 
 
+class TestReceiptAppend:
+    def test_receipt_append_commits_exact_facts_and_replays_after_restart(self, db_path):
+        facts = [
+            {"content": "I prefer concise operational updates.", "category": "user_pref"},
+            {"content": "The project uses isolated Voice memory.", "category": "project"},
+        ]
+        with MemoryStore(db_path) as first:
+            receipt = first.append_receipt("reset_123", facts)
+            assert receipt["reset_id"] == "reset_123"
+            assert receipt["facts"] == [
+                {"fact_id": 1, "category": "user_pref", "content_sha256": "687e4594135f854c271502ac2052874744ce510a3a2baac79c8c84ff7d69d40c"},
+                {"fact_id": 2, "category": "project", "content_sha256": "c0a681437398a662f193c02dce64a9e4bdd2808e3b28b06e7a4346de82443fea"},
+            ]
+
+        with MemoryStore(db_path) as restarted:
+            assert restarted.append_receipt("reset_123", facts) == receipt
+            with pytest.raises(ValueError, match="reset_id"):
+                restarted.append_receipt("reset_123", [
+                    {"content": "Different fact.", "category": "general"},
+                ])
+            assert len(restarted.list_facts(limit=10)) == 2
+
+    def test_provider_exposes_only_durable_receipt_append(self, db_path):
+        from plugins.memory.holographic import HolographicMemoryProvider
+
+        provider = HolographicMemoryProvider(config={"db_path": str(db_path)})
+        provider.initialize("receipt-session")
+        try:
+            receipt = provider.append_receipt("reset_provider", [
+                {"content": "I prefer exact receipts.", "category": "user_pref"},
+            ])
+            assert receipt["reset_id"] == "reset_provider"
+            assert receipt["facts"][0]["category"] == "user_pref"
+        finally:
+            provider.shutdown()
+
+
 class TestProviderShutdown:
     """The provider's shutdown() must release its shared connection, not just
     drop the reference. Leaving finalization to GC keeps the connection (and

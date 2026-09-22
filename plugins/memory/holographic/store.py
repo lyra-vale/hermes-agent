@@ -1,5 +1,7 @@
 """SQLite-backed fact store with entity resolution and trust scoring (single-user Hermes memory plugin)."""
 
+import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -67,6 +69,13 @@ CREATE TABLE IF NOT EXISTS memory_banks (
     dim        INTEGER NOT NULL,
     fact_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS memory_append_receipts (
+    reset_id     TEXT PRIMARY KEY,
+    facts_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    committed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -156,6 +165,87 @@ class MemoryStore:
             self._compute_hrr_vector(fact_id, content)
             self._rebuild_bank(category)
             return fact_id
+
+    def append_receipt(self, reset_id: str, facts: list[dict]) -> dict:
+        """Atomically append exact facts and persist their replayable receipt.
+
+        The reset ID is a provider-owned idempotency key. A retry can retrieve
+        this receipt after a gateway crash without trusting a lost in-memory run.
+        """
+        if not isinstance(reset_id, str) or not reset_id or len(reset_id) > 128:
+            raise ValueError("reset_id is invalid")
+        normalized: list[tuple[str, str]] = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                raise ValueError("receipt facts are invalid")
+            content, category = fact.get("content"), fact.get("category")
+            if (not isinstance(content, str) or content != content.strip() or not content
+                    or not isinstance(category, str) or not category):
+                raise ValueError("receipt facts are invalid")
+            normalized.append((content, category))
+        if not normalized or len({content for content, _ in normalized}) != len(normalized):
+            raise ValueError("receipt facts are invalid")
+        canonical = json.dumps(
+            [{"content": content, "category": category} for content, category in normalized],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        new_facts: list[tuple[int, str, str]] = []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._one(
+                    "SELECT facts_sha256, receipt_json FROM memory_append_receipts WHERE reset_id = ?", (reset_id,))
+                if existing is not None:
+                    if str(existing["facts_sha256"]) != digest:
+                        raise ValueError("reset_id is already bound to different facts")
+                    receipt = json.loads(str(existing["receipt_json"]))
+                    if not isinstance(receipt, dict):
+                        raise ValueError("stored receipt is invalid")
+                    self._conn.execute("COMMIT")
+                    return receipt
+                rows: list[dict] = []
+                for content, category in normalized:
+                    row = self._one("SELECT fact_id, category FROM facts WHERE content = ?", (content,))
+                    if row is None:
+                        fact_id = int(self._conn.execute(
+                            "INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)",
+                            (content, category, "", self.default_trust),
+                        ).lastrowid)
+                        new_facts.append((fact_id, content, category))
+                    else:
+                        fact_id = int(row["fact_id"])
+                        if str(row["category"]) != category:
+                            raise ValueError("receipt fact category does not match persisted fact")
+                    rows.append({
+                        "fact_id": fact_id,
+                        "category": category,
+                        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    })
+                receipt = {"reset_id": reset_id, "facts": rows}
+                self._conn.execute(
+                    "INSERT INTO memory_append_receipts (reset_id, facts_sha256, receipt_json) VALUES (?, ?, ?)",
+                    (reset_id, digest, json.dumps(receipt, separators=(",", ":"), sort_keys=True)),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        # These derived structures are not part of receipt durability. Facts and
+        # receipt are already one committed SQLite transaction at this point.
+        for fact_id, content, category in new_facts:
+            self._link_entities(fact_id, content)
+            self._compute_hrr_vector(fact_id, content)
+            self._rebuild_bank(category)
+        return receipt
+
+    def fact_category(self, fact_id: int) -> str:
+        """Return the committed category for a fact ID, or raise if it vanished."""
+        with self._lock:
+            row = self._one("SELECT category FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                raise KeyError(f"fact_id {fact_id} not found")
+            return str(row["category"])
 
     def update_fact(self, fact_id: int, content: str | None = None, trust_delta: float | None = None,
                     tags: str | None = None, category: str | None = None) -> bool:

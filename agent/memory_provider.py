@@ -58,6 +58,14 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
 
+    # Receipt-bearing append runs require this explicit provider contract. ``1``
+    # means the provider atomically commits exact facts and a replayable receipt.
+    # Providers default to unsupported rather than merely matching a JSON shape.
+    durable_fact_append_receipt_version = 0
+
+    def append_receipt(self, reset_id: str, facts: list[dict]) -> dict:
+        raise NotImplementedError(f"Provider {self.name} does not support receipt append")
+
     # Providers that durably checkpoint every successful on_pre_compress() set this to
     # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.
     pre_compress_checkpoint_api_version = 1
