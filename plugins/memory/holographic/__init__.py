@@ -99,9 +99,6 @@ def _tool_handler(actions: dict):
 class HolographicMemoryProvider(MemoryProvider):
     """Holographic memory with structured facts, entity resolution, and HRR retrieval."""
 
-    # MemoryStore.add_fact commits before returning its positive fact_id.
-    durable_fact_append_receipt_version = 1
-
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
         self._store = self._retriever = None
@@ -147,11 +144,6 @@ class HolographicMemoryProvider(MemoryProvider):
         self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
                                         temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
         self._session_id = session_id
-
-    def append_receipt(self, reset_id: str, facts: list[dict]) -> dict:
-        if self._store is None:
-            raise RuntimeError("Holographic memory is not initialized")
-        return self._store.append_receipt(reset_id, facts)
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -220,13 +212,10 @@ class HolographicMemoryProvider(MemoryProvider):
         """'probe' / 'related': single-entity retriever queries."""
         return _results(getattr(self._retriever, method)(a["entity"], category=a.get("category"), limit=_limit(a)))
 
-    def _add_fact_result(self, args: Dict[str, Any]) -> str:
-        fact_id = self._store.add_fact(args["content"], category=args.get("category", "general"), tags=args.get("tags", ""))
-        return json.dumps({"fact_id": fact_id, "status": "added", "category": self._store.fact_category(fact_id)})
-
     _TOOL_HANDLERS = {
         "fact_store": _tool_handler({
-            "add": lambda self, a: self._add_fact_result(a),
+            "add": lambda self, a: json.dumps({"fact_id": self._store.add_fact(
+                a["content"], category=a.get("category", "general"), tags=a.get("tags", "")), "status": "added"}),
             "search": lambda self, a: _results(self._retriever.search(
                 a["query"], category=a.get("category"), min_trust=float(a.get("min_trust", self._min_trust)), limit=_limit(a))),
             "probe": lambda self, a: self._entity_query("probe", a),

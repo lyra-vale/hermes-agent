@@ -744,11 +744,6 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
-    def receipt_append_provider(self):
-        """Return the sole provider eligible for handler-verified fact receipts."""
-        provider = self._tool_to_provider.get("fact_store")
-        return provider if getattr(provider, "durable_fact_append_receipt_version", 0) == 1 else None
-
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         surface = self._effective_tool_surface
@@ -774,27 +769,11 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
-        # Core-owned ContextVar: an active receipt scope must never degrade to
-        # ordinary provider dispatch merely because policy lookup failed.
-        from agent.memory_append_receipt import current_memory_append_receipt
-        receipt_policy = current_memory_append_receipt()
-        if receipt_policy is not None and getattr(provider, "durable_fact_append_receipt_version", 0) != 1:
-            return tool_error("memory append receipt requires a durable fact append provider")
-        if receipt_policy is not None:
-            denied = receipt_policy.admit(tool_name, args)
-            if denied is not None:
-                return tool_error(denied)
         try:
-            result = provider.handle_tool_call(tool_name, args, **kwargs)
+            return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
-        if receipt_policy is not None:
-            try:
-                receipt_policy.record(tool_name, args, result)
-            except ValueError:
-                return tool_error("memory append receipt could not verify durable fact persistence")
-        return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         if not self.automatic_ingestion_enabled:
