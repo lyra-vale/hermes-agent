@@ -220,9 +220,7 @@ async def test_api_run_publishes_only_a_verified_memory_append_receipt():
     fake_db.get_session.return_value = {"id": "locked-memory-session"}
     locked_runtime = {"persisted_lock": True, "require_model_lock": True, "route": None,
                       "requested": {}, "model_options": {}}
-    with patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": [
-        "file_readonly", "voice_github_issues", "voice_shopify_readonly",
-    ]}}), patch.object(
+    with patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["memory", "memory_append"]}}), patch.object(
         adapter, "_ensure_session_db_async", AsyncMock(return_value=fake_db)
     ), patch("gateway.platforms.api_server_runs._effective_run_runtime_request", return_value=locked_runtime), patch.object(
         adapter, "_runtime_lock_error", return_value=None
