@@ -518,7 +518,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 from gateway.run import _load_gateway_config
                 from hermes_cli.tools_config import _get_platform_tools
                 available_toolsets = _get_platform_tools(_load_gateway_config(), "api_server")
-            requested_toolsets = _validate_run_toolsets(body, available_toolsets)
+            # Receipt mode is server-internal after admission: its exact one-tool
+            # envelope is checked below and must not require the normal API
+            # capability universe to expose a generic memory write surface.
+            if ("memory_append_receipt" in body and body.get("toolsets") == ["memory_append"]):
+                requested_toolsets = ["memory_append"]
+            else:
+                requested_toolsets = _validate_run_toolsets(body, available_toolsets)
         except ValueError as exc:
             return _json_error(_openai_error, str(exc), code="invalid_toolsets", status=400)
         except Exception:
