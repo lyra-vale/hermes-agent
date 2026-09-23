@@ -15,6 +15,7 @@ sent in a notification.
 from __future__ import annotations
 
 import contextvars
+import functools
 import hashlib
 import hmac
 import json
@@ -211,6 +212,37 @@ _CURRENT_AUTHORIZATION: contextvars.ContextVar[Optional[_DispatchAuthorization]]
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: Dict[tuple[str, str], set[Any]] = {}
+_RETIRED_RUN_IDS: set[str] = set()
+
+
+def _mark_run_retired(run_id: str) -> None:
+    """Leave a process-local tombstone so late attachment cannot revive a run."""
+    with _ACTIVE_STORE_LOCK:
+        _RETIRED_RUN_IDS.add(run_id)
+
+
+def _run_is_retired(run_id: str) -> bool:
+    with _ACTIVE_STORE_LOCK:
+        return run_id in _RETIRED_RUN_IDS
+
+
+def _clear_current_run_authorization(run_id: str, approval_session: Optional[str] = None) -> None:
+    """Drop caller state when the run owning it is retired."""
+    try:
+        context = _CURRENT_API_RUN_CONTEXT.get()
+        binding = _CURRENT_BINDING.get()
+        context_matches = context is not None and context.run_id == run_id and (
+            approval_session is None or context.approval_session == approval_session
+        )
+        binding_matches = binding is not None and binding.policy.run_id == run_id and (
+            approval_session is None or binding.policy.approval_session == approval_session
+        )
+        if context_matches or binding_matches:
+            _CURRENT_AUTHORIZATION.set(None)
+    except BaseException:
+        # Retirement is a fail-closed boundary even when ContextVar inspection
+        # is unavailable.
+        _CURRENT_AUTHORIZATION.set(None)
 
 
 def _track_active_store(key: tuple[str, str], store: Any) -> None:
@@ -415,22 +447,34 @@ class ProtectedApiRunApprovalStore:
         now = float(self._clock())
         if now >= policy.expires_at:
             raise ProtectedApprovalError("Protected policy has expired", code="approval_expired")
+        if _run_is_retired(policy.run_id):
+            raise ProtectedApprovalError(
+                "Protected API run has retired", code="approval_run_retired"
+            )
         key = (policy.run_id, policy.approval_session)
-        with self._lock:
-            existing = self._policies.get(key)
-            if existing is not None:
-                if existing[0] != policy:
-                    raise ProtectedApprovalError(
-                        "A different protected policy is already bound to this run",
-                        code="approval_policy_conflict",
-                    )
-                if pending_callback is not None and existing[1] is not pending_callback:
-                    self._policies[key] = (existing[0], pending_callback, existing[2])
+        # Serialize the tombstone check with active-store tracking. Otherwise a
+        # retirement could mark the run and snapshot stores between this check
+        # and a delayed registration, allowing the late attach to revive it.
+        with _ACTIVE_STORE_LOCK:
+            if _run_is_retired(policy.run_id):
+                raise ProtectedApprovalError(
+                    "Protected API run has retired", code="approval_run_retired"
+                )
+            with self._lock:
+                existing = self._policies.get(key)
+                if existing is not None:
+                    if existing[0] != policy:
+                        raise ProtectedApprovalError(
+                            "A different protected policy is already bound to this run",
+                            code="approval_policy_conflict",
+                        )
+                    if pending_callback is not None and existing[1] is not pending_callback:
+                        self._policies[key] = (existing[0], pending_callback, existing[2])
+                    _track_active_store(key, self)
+                    return existing[0]
+                self._policy_epoch += 1
+                self._policies[key] = (policy, pending_callback, self._policy_epoch)
                 _track_active_store(key, self)
-                return existing[0]
-            self._policy_epoch += 1
-            self._policies[key] = (policy, pending_callback, self._policy_epoch)
-            _track_active_store(key, self)
         return policy
 
     def is_protected_run(self, run_id: str, approval_session: Optional[str] = None) -> bool:
@@ -693,17 +737,19 @@ class ProtectedApiRunApprovalStore:
 
     def retire_run(self, run_id: str, approval_session: Optional[str] = None) -> None:
         """Fail closed and forget policy bindings when an API run retires."""
-        with self._lock:
-            keys = [
-                key for key in self._policies
-                if key[0] == run_id and (approval_session is None or key[1] == approval_session)
-            ]
-            for key in keys:
-                self._policies.pop(key, None)
-                _untrack_active_store(key, self)
-            for record in list(self._records.values()):
-                if record.run_id == run_id and (approval_session is None or record.approval_session == approval_session):
-                    self._expire_locked(record, message="Protected API run retired")
+        _clear_current_run_authorization(run_id, approval_session)
+        with _ACTIVE_STORE_LOCK:
+            with self._lock:
+                keys = [
+                    key for key in self._policies
+                    if key[0] == run_id and (approval_session is None or key[1] == approval_session)
+                ]
+                for key in keys:
+                    self._policies.pop(key, None)
+                    _untrack_active_store(key, self)
+                for record in list(self._records.values()):
+                    if record.run_id == run_id and (approval_session is None or record.approval_session == approval_session):
+                        self._expire_locked(record, message="Protected API run retired")
 
 
 _DEFAULT_STORE = ProtectedApiRunApprovalStore()
@@ -739,6 +785,20 @@ def reset_current_api_run_context(tokens) -> None:
         _CURRENT_API_RUN_CONTEXT.set(None)
 
 
+def _clear_attachment_state_on_failure(function):
+    """Make a failed policy attach unable to preserve caller authorization state."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except BaseException:
+            _CURRENT_AUTHORIZATION.set(None)
+            _CURRENT_BINDING.set(None)
+            raise
+    return wrapped
+
+
+@_clear_attachment_state_on_failure
 def attach_protected_api_run_policy(
     policy: ProtectedApiRunApprovalPolicy,
     *,
@@ -749,6 +809,7 @@ def attach_protected_api_run_policy(
     # Attachment starts a fresh authorization boundary. Clearing first also
     # prevents a failed policy bind from leaving an older token live.
     _CURRENT_AUTHORIZATION.set(None)
+    target_store = store or _DEFAULT_STORE
     context = _CURRENT_API_RUN_CONTEXT.get()
     context_created = False
     if context is None:
@@ -759,8 +820,12 @@ def attach_protected_api_run_policy(
             )
         context = _ApiRunContext(policy.run_id, policy.approval_session, pending_callback)
         context_created = True
+    if _run_is_retired(context.run_id):
+        _CURRENT_AUTHORIZATION.set(None)
+        raise ProtectedApprovalError(
+            "Protected API run has retired", code="approval_run_retired"
+        )
     bound = policy.for_run(run_id=context.run_id, approval_session=context.approval_session)
-    target_store = store or _DEFAULT_STORE
     callback = pending_callback if pending_callback is not None else context.pending_callback
     registered = target_store.register_policy(bound, pending_callback=callback)
     binding = target_store.binding_for(registered.run_id or "", registered.approval_session or "")
@@ -880,15 +945,9 @@ def safe_protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dic
     try:
         return protected_observer_args(tool_name, args)
     except Exception:
-        try:
-            if _resolve_current_protected_binding() is not None:
-                return {}
-        except Exception:
-            return {}
-        try:
-            return dict(args)
-        except Exception:
-            return {}
+        # A sanitizer/status lookup failure is ambiguous: never recover by
+        # echoing the original action payload to a diagnostic observer.
+        return {}
 
 
 def protected_api_run_context_active() -> bool:
@@ -900,7 +959,7 @@ def protected_exception_diagnostic(tool_name: str, exc: BaseException) -> str:
     """Return a handler diagnostic that cannot interpolate protected action data."""
     try:
         active = protected_api_run_context_active()
-    except Exception:
+    except BaseException:
         active = True
     if active:
         return f"Protected tool '{tool_name}' execution failed ({type(exc).__name__})"
@@ -964,6 +1023,9 @@ def require_protected_api_run_approval(
     if binding is None:
         # A stale token must not survive a legacy/no-policy early return.
         clear_current_protected_dispatch_authorization()
+        context = _CURRENT_API_RUN_CONTEXT.get()
+        if context is not None and _run_is_retired(context.run_id):
+            return blocked("BLOCKED: protected API run has retired")
         return {"approved": True, "protected": False}
     if not _binding_is_active(binding):
         return blocked("BLOCKED: protected policy is not active for this run")
@@ -1099,6 +1161,8 @@ def submit_protected_api_approval(
 
 def retire_protected_api_run(run_id: str, approval_session: Optional[str] = None) -> None:
     """Retire every active policy store for a protected run."""
+    _mark_run_retired(run_id)
+    _clear_current_run_authorization(run_id, approval_session)
     stores = set(_active_stores_for(run_id, approval_session))
     stores.add(_DEFAULT_STORE)
     for store in stores:

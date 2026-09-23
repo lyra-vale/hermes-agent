@@ -834,15 +834,19 @@ class ToolRegistry:
                 # traceback that could contain a protected action payload.
                 protected_context = True
                 diagnostic = f"Protected tool '{name}' execution failed ({type(e).__name__})"
+            try:
+                from model_tools import _sanitize_tool_error
+                sanitized = _sanitize_tool_error(diagnostic)
+            except BaseException:
+                # A sanitizer failure is an unknown security state. Keep both
+                # the returned diagnostic and the log free of raw exception text.
+                protected_context = True
+                diagnostic = f"Protected tool '{name}' execution failed ({type(e).__name__})"
+                sanitized = f"[TOOL_ERROR] {diagnostic}"
             if protected_context:
                 logger.error("Tool %s dispatch failed in protected API run (%s)", name, type(e).__name__)
             else:
                 logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
-            try:
-                from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(diagnostic)
-            except Exception:
-                sanitized = diagnostic
             return tool_error(sanitized)
 
     # ---- Query helpers -----------------------------------------------

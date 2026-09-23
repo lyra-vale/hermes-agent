@@ -113,6 +113,241 @@ def test_execution_middleware_replacement_cannot_change_approved_action(monkeypa
     assert len(events) == 1
 
 
+def test_model_dispatch_clears_authorization_when_request_middleware_raises(monkeypatch):
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    monkeypatch.setattr(
+        model_tools,
+        "_apply_request_middleware",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("middleware failed")),
+    )
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _args())["approved"] is True
+        with pytest.raises(RuntimeError, match="middleware failed"):
+            model_tools.handle_function_call(
+                "write_file", _args(), task_id="dispatch-task", skip_pre_tool_call_hook=True,
+            )
+        assert not protected.has_current_protected_dispatch_authorization()
+        assert protected.verify_protected_dispatch("write_file", _args()) is False
+
+
+def test_agent_runtime_clears_authorization_when_request_middleware_propagates(monkeypatch):
+    from types import SimpleNamespace
+    from agent import agent_runtime_helpers
+
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_tool_request_middleware",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("middleware failed")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("execution middleware failed")),
+    )
+    agent = SimpleNamespace(session_id="dispatch-session")
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _args())["approved"] is True
+        with pytest.raises(RuntimeError, match="execution middleware failed"):
+            agent_runtime_helpers.invoke_tool(
+                agent,
+                "write_file",
+                _args(),
+                "dispatch-task",
+                pre_tool_block_checked=True,
+            )
+        assert not protected.has_current_protected_dispatch_authorization()
+        assert protected.verify_protected_dispatch("write_file", _args()) is False
+
+
+def test_agent_executor_clears_authorization_when_request_middleware_raises(monkeypatch):
+    from types import SimpleNamespace
+    from agent import tool_executor
+
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_tool_request_middleware",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("executor middleware failed")),
+    )
+    agent = SimpleNamespace(session_id="dispatch-session")
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _args())["approved"] is True
+        with pytest.raises(RuntimeError, match="executor middleware failed"):
+            tool_executor._run_agent_tool_execution_middleware(
+                agent,
+                function_name="write_file",
+                function_args=_args(),
+                effective_task_id="dispatch-task",
+                tool_call_id="call-1",
+                execute=lambda args: json.dumps({"ok": True}),
+            )
+        assert not protected.has_current_protected_dispatch_authorization()
+        assert protected.verify_protected_dispatch("write_file", _args()) is False
+
+
+def test_model_verifier_exception_clears_authorization(monkeypatch):
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    monkeypatch.setattr(
+        protected,
+        "verify_protected_dispatch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("verifier failed")),
+    )
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _args())["approved"] is True
+        result = model_tools.handle_function_call(
+            "write_file",
+            _args(),
+            task_id="dispatch-task",
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+        assert "verification failed" in result
+        assert not protected.has_current_protected_dispatch_authorization()
+
+
+def test_agent_verifier_exception_clears_authorization(monkeypatch):
+    from types import SimpleNamespace
+    from agent import agent_runtime_helpers, inline_tool_executors
+
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    monkeypatch.setattr(
+        inline_tool_executors,
+        "resolve_invoke_tool_executor",
+        lambda *_args, **_kwargs: lambda *_executor_args, **_executor_kwargs: json.dumps({"ok": True}),
+    )
+    monkeypatch.setattr(
+        protected,
+        "verify_protected_dispatch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("verifier failed")),
+    )
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _args())["approved"] is True
+        result = agent_runtime_helpers.invoke_tool(
+            SimpleNamespace(session_id="dispatch-session"),
+            "write_file",
+            _args(),
+            "dispatch-task",
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+        assert "verification failed" in result
+        assert not protected.has_current_protected_dispatch_authorization()
+
+
+def test_tool_exception_logging_redacts_when_protected_status_lookup_raises(monkeypatch, caplog):
+    from agent import tool_executor
+
+    raw = "/calendar/handler-secret.json raw-handler-secret"
+    monkeypatch.setattr(
+        protected,
+        "protected_api_run_context_active",
+        lambda: (_ for _ in ()).throw(RuntimeError(raw)),
+    )
+    with caplog.at_level("ERROR"):
+        tool_executor._log_tool_exception("write_file", RuntimeError(raw))
+
+    assert raw not in caplog.text
+    assert "write_file" in caplog.text
+
+
+def test_model_exception_diagnostic_redacts_when_status_and_sanitizer_raise(monkeypatch, caplog):
+    raw = "/calendar/handler-secret.json sanitizer-secret"
+    monkeypatch.setattr(
+        protected,
+        "protected_api_run_context_active",
+        lambda: (_ for _ in ()).throw(RuntimeError(raw)),
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "_execute_tool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(raw)),
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "_sanitize_tool_error",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("sanitizer unavailable")),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = model_tools.handle_function_call(
+            "write_file",
+            _args(),
+            task_id="dispatch-task",
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
+    assert raw not in result
+    assert raw not in caplog.text
+    assert "Protected tool 'write_file' execution failed" in result
+
+
 def test_protected_observer_does_not_receive_raw_arguments(monkeypatch):
     observed = []
     monkeypatch.setattr(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import json
 from pathlib import Path
 import logging
@@ -67,6 +68,29 @@ def _tc_name(tool_call: Any) -> str:
     return getattr(getattr(tool_call, "function", None), "name", "") or "tool"
 
 
+def _clear_protected_authorization_state() -> None:
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except BaseException:
+        try:
+            from tools.protected_api_approval import _CURRENT_AUTHORIZATION
+            _CURRENT_AUTHORIZATION.set(None)
+        except BaseException:
+            pass
+
+
+def _protected_authorization_boundary(function):
+    """Clear the caller/worker's one-use protected token on every executor exit."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _clear_protected_authorization_state()
+    return wrapped
+
+
 def _protected_runtime_callback_args(function_name: str, args: dict) -> dict:
     """Keep agent UI/diagnostic callbacks fail-closed for protected actions."""
     try:
@@ -85,23 +109,33 @@ def _protected_tool_exception_diagnostic(function_name: str, exc: Exception) -> 
     try:
         from tools.protected_api_approval import protected_exception_diagnostic
         return protected_exception_diagnostic(function_name, exc)
-    except Exception:
+    except BaseException:
         return f"Error executing tool '{function_name}' failed ({type(exc).__name__})"
 
 
 def _log_tool_exception(function_name: str, exc: Exception) -> None:
+    cleanup_succeeded = True
+    protected_state_known = False
     try:
         from tools.protected_api_approval import clear_current_protected_dispatch_authorization
         clear_current_protected_dispatch_authorization()
-    except Exception:
-        pass
+    except BaseException:
+        # An unavailable cleanup boundary is itself a protected-state failure.
+        # Do not fall through to a raw exception log when its status is unknown.
+        cleanup_succeeded = False
+        _clear_protected_authorization_state()
     try:
         from tools.protected_api_approval import protected_api_run_context_active
-        if protected_api_run_context_active():
+        protected_active = protected_api_run_context_active()
+        protected_state_known = True
+        if protected_active:
             logger.error("tool %s raised (%s)", function_name, type(exc).__name__)
             return
-    except Exception:
-        pass
+    except BaseException:
+        protected_active = True
+    if not cleanup_succeeded or not protected_state_known or protected_active:
+        logger.error("tool %s raised (%s)", function_name, type(exc).__name__)
+        return
     logger.error("tool %s raised: %s", function_name, exc, exc_info=True)
 
 
@@ -658,8 +692,8 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
     try:
         from tools.protected_api_approval import clear_current_protected_dispatch_authorization
         clear_current_protected_dispatch_authorization()
-    except Exception:
-        pass
+    except BaseException:
+        _clear_protected_authorization_state()
     if block_message is not None:
         result, error_type, error_message = json.dumps({"error": block_message}, ensure_ascii=False), block_error_type, block_message
     else:
@@ -698,10 +732,12 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
                 clear_current_protected_dispatch_authorization()
                 return "BLOCKED: protected API approval hook failed", ref.args
         except Exception:
+            _clear_protected_authorization_state()
             return "BLOCKED: protected API approval hook verification failed", ref.args
         return None, ref.args
 
 
+@_protected_authorization_boundary
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -757,6 +793,7 @@ def _dispatch_authorized_once(
         from tools.protected_api_approval import require_protected_api_run_approval
         protected_decision = require_protected_api_run_approval(ref.name, ref.args)
     except Exception:
+        _clear_protected_authorization_state()
         protected_decision = {
             "approved": False,
             "message": "BLOCKED: protected API approval verification failed",
@@ -801,6 +838,7 @@ def _dispatch_authorized_once(
         # A protected final-dispatch check is a security boundary.  If the
         # verifier or the authorization-state lookup fails, there is no safe
         # way to prove that this call is legacy/unprotected; block it.
+        _clear_protected_authorization_state()
         _advance_start_order()
         state.blocked = True
         message = "BLOCKED: protected API approval verification failed"
@@ -826,6 +864,7 @@ def _dispatch_authorized_once(
             clear_current_protected_dispatch_authorization()
 
 
+@_protected_authorization_boundary
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -957,6 +996,7 @@ def _poll_sequential_future(agent, future, function_name: str, deadline: float |
                 agent._touch_activity(f"sequential tool running ({elapsed}s): {function_name}")
 
 
+@_protected_authorization_boundary
 def _run_sequential_tool_execution_middleware(
     agent,
     *,
@@ -1541,6 +1581,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
+@_protected_authorization_boundary
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
@@ -1760,8 +1801,9 @@ def _run_sequential_call(
             try:
                 from tools.protected_api_approval import protected_api_run_context_active
                 protected_active = protected_api_run_context_active()
-            except Exception:
-                protected_active = False
+            except BaseException:
+                _clear_protected_authorization_state()
+                protected_active = True
             if not protected_active:
                 raise
             function_result = _protected_tool_exception_diagnostic(ref.name, tool_error)
@@ -1811,6 +1853,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     return True
 
 
+@_protected_authorization_boundary
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (single calls or interactive tools). ``finalize=False``
     skips end-of-batch budget enforcement and /steer injection (the segmented dispatcher
@@ -1875,6 +1918,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget)
 
 
+@_protected_authorization_boundary
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed batch as ordered parallel/sequential segments (the ``(kind, calls)``
     plan from ``_plan_tool_batch_segments``), preserving per-call result order and barrier

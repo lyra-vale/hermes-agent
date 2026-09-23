@@ -10,6 +10,7 @@ import os
 import json
 import re
 import asyncio
+import functools
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
@@ -621,8 +622,40 @@ def _clear_protected_authorization_state() -> None:
     try:
         from tools.protected_api_approval import clear_current_protected_dispatch_authorization
         clear_current_protected_dispatch_authorization()
-    except Exception:
-        pass
+    except BaseException:
+        try:
+            from tools.protected_api_approval import _CURRENT_AUTHORIZATION
+            _CURRENT_AUTHORIZATION.set(None)
+        except BaseException:
+            pass
+
+
+def _protected_authorization_boundary(function):
+    """Clear the caller's one-use protected token on every dispatch exit."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _clear_protected_authorization_state()
+    return wrapped
+
+
+def _protected_exception_log_text(function_name: str, exc: BaseException) -> str:
+    """Return raw exception text only after protected-state detection succeeds."""
+    try:
+        from tools.protected_api_approval import (
+            protected_api_run_context_active,
+            protected_exception_diagnostic,
+        )
+        if protected_api_run_context_active():
+            try:
+                return protected_exception_diagnostic(function_name, exc)
+            except BaseException:
+                return f"Protected tool '{function_name}' failed ({type(exc).__name__})"
+        return str(exc)
+    except BaseException:
+        return f"Protected tool '{function_name}' failed ({type(exc).__name__})"
 
 
 def _sanitize_tool_error(error_msg: str) -> str:
@@ -700,7 +733,7 @@ def _emit_post_tool_call_hook(
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        logger.debug("post_tool_call hook error: %s", _protected_exception_log_text(function_name, _hook_err))
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
@@ -758,7 +791,8 @@ def _apply_request_middleware(
         mw = apply_tool_request_middleware(function_name, function_args, **ids.hook_kwargs())
         return mw.payload, mw.original_payload, mw.trace
     except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
+        _clear_protected_authorization_state()
+        logger.debug("tool_request middleware error: %s", _protected_exception_log_text(function_name, _mw_err))
         return function_args, dict(function_args), trace
 
 
@@ -794,10 +828,12 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             except Exception:
                 # A protected-context lookup failure cannot make this boundary
                 # fail open. The core gate remains the last line of defense.
+                _clear_protected_authorization_state()
                 message = "BLOCKED: protected API approval hook verification failed"
                 return function_args, (tool_error(message), "protected_api_approval", message)
             logger.debug("pre_tool_call hook error (%s)", type(_hook_err).__name__)
         if block_message is not None:
+            _clear_protected_authorization_state()
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
     # ACP/Zed edit approval before any file mutation. The requester is bound
@@ -806,10 +842,15 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         from acp_adapter.edit_approval import maybe_require_edit_approval
         edit_block_message = maybe_require_edit_approval(function_name, function_args)
         if edit_block_message is not None:
+            _clear_protected_authorization_state()
             return function_args, (edit_block_message, "edit_approval_denied", None)
     except Exception as _edit_approval_err:
-        logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+        logger.debug(
+            "ACP edit approval guard error: %s",
+            _protected_exception_log_text(function_name, _edit_approval_err),
+        )
         if function_name in {"write_file", "patch"}:
+            _clear_protected_authorization_state()
             return function_args, (tool_error("Edit approval denied: approval guard failed"), "edit_approval_error", None)
     return function_args, None
 
@@ -858,6 +899,7 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
             # unguarded registry call.  Fail closed even when context lookup
             # itself is unavailable; there is no safe way to prove this is a
             # legacy, unprotected call at this boundary.
+            _clear_protected_authorization_state()
             return tool_error("BLOCKED: protected API approval verification failed")
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
@@ -903,6 +945,7 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
+@_protected_authorization_boundary
 def handle_function_call(
     function_name: str, function_args: Dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
@@ -991,8 +1034,8 @@ def handle_function_call(
             try:
                 from tools.protected_api_approval import clear_current_protected_dispatch_authorization
                 clear_current_protected_dispatch_authorization()
-            except Exception:
-                pass
+            except BaseException:
+                _clear_protected_authorization_state()
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
 
         # This core-side gate runs even when the caller says the pre-tool hook
@@ -1002,11 +1045,13 @@ def handle_function_call(
             from tools.protected_api_approval import require_protected_api_run_approval
             protected_decision = require_protected_api_run_approval(function_name, function_args)
         except Exception:
+            _clear_protected_authorization_state()
             protected_decision = {
                 "approved": False,
                 "message": "BLOCKED: protected API approval verification failed",
             }
         if not protected_decision.get("approved", False):
+            _clear_protected_authorization_state()
             message = str(protected_decision.get("message") or "BLOCKED: protected API approval required")
             return _emit(
                 tool_error(message),
@@ -1044,11 +1089,20 @@ def handle_function_call(
         except Exception:
             protected_context = True
             diagnostic = f"Protected tool '{function_name}' execution failed ({type(e).__name__})"
+        try:
+            safe_error = _sanitize_tool_error(diagnostic)
+        except BaseException:
+            # If sanitization is unavailable, the context may be protected even
+            # when the status probe above was inconclusive. Never return/log the
+            # original exception as a fallback diagnostic.
+            safe_error = f"[TOOL_ERROR] Protected tool '{function_name}' execution failed ({type(e).__name__})"
+            diagnostic = f"Protected tool '{function_name}' execution failed ({type(e).__name__})"
+            protected_context = True
         if protected_context:
             logger.error("Tool %s execution failed in protected API run (%s)", function_name, type(e).__name__)
         else:
             logger.exception("Error executing %s: %s", function_name, str(e))
-        return _emit(tool_error(_sanitize_tool_error(diagnostic)), duration_ms=_elapsed_ms(start),
+        return _emit(tool_error(safe_error), duration_ms=_elapsed_ms(start),
                      status="error", error_type=type(e).__name__, error_message=diagnostic)
 
 

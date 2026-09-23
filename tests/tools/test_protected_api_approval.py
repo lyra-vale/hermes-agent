@@ -300,6 +300,55 @@ def test_equal_policy_re_registration_invalidates_old_dispatch_authorization():
         protected.reset_current_api_run_context(tokens)
 
 
+def test_retired_run_rejects_delayed_policy_attachment():
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy(run_id="run_delayed_attach", approval_session="approval_delayed_attach")
+    tokens = protected.set_current_api_run_context(
+        run_id=policy.run_id,
+        approval_session=policy.approval_session,
+    )
+    try:
+        store.register_policy(policy)
+        protected.retire_protected_api_run(policy.run_id, policy.approval_session)
+
+        with pytest.raises(protected.ProtectedApprovalError) as exc:
+            protected.attach_protected_api_run_policy(policy, store=store)
+
+        assert exc.value.code == "approval_run_retired"
+        assert not protected.is_protected_api_run(policy.run_id, policy.approval_session)
+    finally:
+        protected.reset_current_api_run_context(tokens)
+
+
+def test_failed_policy_attachment_clears_binding_and_authorization(monkeypatch):
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy(run_id="run_attach_failure", approval_session="approval_attach_failure")
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    with _bound(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _action())["approved"] is True
+
+        def fail_registration(*_args, **_kwargs):
+            raise RuntimeError("late protected attachment failed")
+
+        monkeypatch.setattr(store, "register_policy", fail_registration)
+        with pytest.raises(RuntimeError, match="late protected attachment failed"):
+            protected.attach_protected_api_run_policy(policy, store=store)
+
+        assert not protected.has_current_protected_dispatch_authorization()
+        assert protected._CURRENT_BINDING.get() is None
+
+
 def test_final_authorization_state_is_cleared_on_policy_early_return_and_resolution_error(monkeypatch):
     store = protected.ProtectedApiRunApprovalStore()
     policy = _policy(run_id="run_context_cleanup", approval_session="approval_context_cleanup")

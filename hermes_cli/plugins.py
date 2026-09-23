@@ -218,6 +218,18 @@ class LoadedPlugin:
     deferred: bool = False
 
 
+def _clear_protected_plugin_authorization() -> None:
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except BaseException:
+        try:
+            from tools.protected_api_approval import _CURRENT_AUTHORIZATION
+            _CURRENT_AUTHORIZATION.set(None)
+        except BaseException:
+            pass
+
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
@@ -686,7 +698,25 @@ class PluginContext:
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
         """Dispatch a tool call through the registry with the parent agent (when available)
         resolved automatically; returns the handler's JSON string. ``kwargs`` forward to dispatch."""
-        from tools.registry import registry
+        from tools.registry import registry, tool_error
+        # PluginContext is not an authorization boundary.  A direct registry
+        # call from a protected API-run callback would otherwise skip the core
+        # final verifier, so deny the whole alternate surface while protected
+        # state is present.  Lookup failures also deny: the plugin path cannot
+        # safely prove that this is an unprotected legacy call.
+        try:
+            from tools.protected_api_approval import (
+                current_protected_api_run_binding,
+                protected_api_run_context_active,
+            )
+            protected_active = protected_api_run_context_active()
+            protected_binding = current_protected_api_run_binding()
+            if protected_active or protected_binding is not None:
+                _clear_protected_plugin_authorization()
+                return tool_error("BLOCKED: plugin tool dispatch is unavailable in a protected API run")
+        except BaseException:
+            _clear_protected_plugin_authorization()
+            return tool_error("BLOCKED: protected API approval verification failed")
         # In gateway mode _cli_ref is None — tools degrade gracefully (no spinner, TERMINAL_CWD).
         if "parent_agent" not in kwargs:
             agent = getattr(self._manager._cli_ref, "agent", None)

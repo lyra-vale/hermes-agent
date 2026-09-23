@@ -7,6 +7,7 @@ Each function takes the parent ``AIAgent`` as ``agent`` except the stateless mes
 from __future__ import annotations
 import contextlib
 import copy
+import functools
 import json
 import logging
 import re
@@ -83,6 +84,29 @@ def _protected_observer_args_or_empty(function_name: str, args: dict) -> dict:
         return safe_protected_observer_args(function_name, args)
     except Exception:
         return {}
+
+
+def _clear_protected_authorization_state() -> None:
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except BaseException:
+        try:
+            from tools.protected_api_approval import _CURRENT_AUTHORIZATION
+            _CURRENT_AUTHORIZATION.set(None)
+        except BaseException:
+            pass
+
+
+def _protected_authorization_boundary(function):
+    """Clear the caller's one-use protected token on every runtime exit."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _clear_protected_authorization_state()
+    return wrapped
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
@@ -2238,10 +2262,12 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
                 clear_current_protected_dispatch_authorization()
                 return "BLOCKED: protected API approval hook failed", function_args
         except Exception:
+            _clear_protected_authorization_state()
             return "BLOCKED: protected API approval hook verification failed", function_args
         return None, function_args
 
 
+@_protected_authorization_boundary
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -2267,6 +2293,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
+        _clear_protected_authorization_state()
         logger.debug("tool_request middleware error (%s)", type(_mw_err).__name__)
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
@@ -2277,8 +2304,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from tools.protected_api_approval import clear_current_protected_dispatch_authorization
             clear_current_protected_dispatch_authorization()
-        except Exception:
-            pass
+        except BaseException:
+            _clear_protected_authorization_state()
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         emit_terminal_post_tool_call(
             agent, function_name=function_name, function_args=_protected_observer_args_or_empty(function_name, function_args), result=result,
@@ -2294,11 +2321,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             from tools.protected_api_approval import require_protected_api_run_approval
             protected_decision = require_protected_api_run_approval(function_name, next_args)
         except Exception:
+            _clear_protected_authorization_state()
             protected_decision = {
                 "approved": False,
                 "message": "BLOCKED: protected API approval verification failed",
             }
         if not protected_decision.get("approved", False):
+            _clear_protected_authorization_state()
             message = str(protected_decision.get("message") or "BLOCKED: protected API approval required")
             result = json.dumps({"error": message}, ensure_ascii=False)
             emit_terminal_post_tool_call(
@@ -2319,6 +2348,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             try:
                 from tools.protected_api_approval import verify_protected_dispatch
                 if not verify_protected_dispatch(function_name, next_args):
+                    _clear_protected_authorization_state()
                     message = "BLOCKED: the protected API approval did not authorize this exact action"
                     result = json.dumps({"error": message}, ensure_ascii=False)
                     emit_terminal_post_tool_call(
@@ -2335,6 +2365,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     )
                     return result
             except Exception:
+                _clear_protected_authorization_state()
                 message = "BLOCKED: protected API approval verification failed"
                 result = json.dumps({"error": message}, ensure_ascii=False)
                 emit_terminal_post_tool_call(
@@ -2389,8 +2420,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             try:
                 from tools.protected_api_approval import clear_current_protected_dispatch_authorization
                 clear_current_protected_dispatch_authorization()
-            except Exception:
-                pass
+            except BaseException:
+                _clear_protected_authorization_state()
             result = json.dumps({"error": scope_block}, ensure_ascii=False)
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,

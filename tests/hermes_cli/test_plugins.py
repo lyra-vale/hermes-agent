@@ -3,6 +3,7 @@
 import logging
 import json
 import sys
+import time
 import threading
 import types
 from pathlib import Path
@@ -2393,6 +2394,31 @@ class TestPluginDispatchTool:
 
         call_kwargs = mock_registry.dispatch.call_args
         assert call_kwargs[1]["parent_agent"] is explicit_agent
+
+    def test_dispatch_tool_cannot_bypass_protected_api_approval(self):
+        from tools import protected_api_approval as protected
+
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        policy = protected.ProtectedApiRunApprovalPolicy(
+            allowed_tool_names=("write_file",),
+            run_id="plugin-protected-run",
+            approval_session="plugin-protected-approval",
+            user_session_id="plugin-user",
+            hermes_session_id="plugin-hermes",
+            conversation_id="plugin-conversation",
+            expires_at=time.time() + 30,
+        )
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = '{"ok": true}'
+
+        with protected.bind_protected_api_run(policy):
+            with patch("tools.registry.registry", mock_registry):
+                result = ctx.dispatch_tool("write_file", {"path": "/calendar/event.json"})
+
+        assert "protected API" in json.loads(result)["error"]
+        mock_registry.dispatch.assert_not_called()
 
 
 class TestPluginDebugLogging:

@@ -588,6 +588,17 @@ async def test_real_api_run_lifecycle_admission_executor_status_and_stop(monkeyp
         assert status_payload["status"] == "cancelled"
         assert run_id not in adapter._active_run_agents
 
+        late_context = protected.set_current_api_run_context(
+            run_id=run_id,
+            approval_session=run_id,
+        )
+        try:
+            with pytest.raises(protected.ProtectedApprovalError) as exc:
+                protected.attach_protected_api_run_policy(_policy(run_id))
+            assert exc.value.code == "approval_run_retired"
+        finally:
+            protected.reset_current_api_run_context(late_context)
+
 
 async def _wait_for(predicate, timeout=2.0):
     deadline = asyncio.get_running_loop().time() + timeout
