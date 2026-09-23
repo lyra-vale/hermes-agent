@@ -546,10 +546,13 @@ class ProtectedApiRunApprovalStore:
         return policy
 
     def is_protected_run(self, run_id: str, approval_session: Optional[str] = None) -> bool:
-        with self._lock:
-            if approval_session is not None:
-                return (run_id, approval_session) in self._policies
-            return any(key[0] == run_id for key in self._policies)
+        with _ACTIVE_STORE_LOCK:
+            if _run_is_retired(run_id):
+                return False
+            with self._lock:
+                if approval_session is not None:
+                    return (run_id, approval_session) in self._policies
+                return any(key[0] == run_id for key in self._policies)
 
     def binding_for(self, run_id: str, approval_session: str) -> Optional[ProtectedApiRunBinding]:
         with self._lock:
@@ -564,23 +567,29 @@ class ProtectedApiRunApprovalStore:
         approval_session = binding.policy.approval_session
         if not run_id or not approval_session:
             return False
-        with self._lock:
-            registered = self._policies.get((run_id, approval_session))
-            return bool(
-                registered is not None
-                and registered[0] == binding.policy
-                and registered[2] == binding.policy_epoch
-            )
+        with _ACTIVE_STORE_LOCK:
+            if _run_is_retired(run_id):
+                return False
+            with self._lock:
+                registered = self._policies.get((run_id, approval_session))
+                return bool(
+                    registered is not None
+                    and registered[0] == binding.policy
+                    and registered[2] == binding.policy_epoch
+                )
 
     def status_payload(
         self, *, run_id: str, approval_session: str, request_id: str
     ) -> Optional[Dict[str, Any]]:
         """Return a safe status envelope built from the stored policy/record."""
-        with self._lock:
-            record = self._records.get((run_id, approval_session, request_id))
-            if record is None or record.consumed:
+        with _ACTIVE_STORE_LOCK:
+            if _run_is_retired(run_id):
                 return None
-            return _safe_metadata(record)
+            with self._lock:
+                record = self._records.get((run_id, approval_session, request_id))
+                if record is None or record.consumed:
+                    return None
+                return _safe_metadata(record)
 
     def _remove_record_locked(self, record: _PendingApproval) -> None:
         record_key = (record.run_id, record.approval_session, record.request_id)
@@ -620,6 +629,8 @@ class ProtectedApiRunApprovalStore:
         _CURRENT_AUTHORIZATION.set(None)
         if not policy.run_id or not policy.approval_session:
             return {"approved": False, "message": "BLOCKED: protected policy is not bound to an API run"}
+        if _run_is_retired(policy.run_id):
+            return {"approved": False, "message": "BLOCKED: protected API run has retired"}
         try:
             normalized_tool = normalize_registered_tool_name(tool_name)
             action_digest = canonical_action_digest(normalized_tool, args)
@@ -757,39 +768,48 @@ class ProtectedApiRunApprovalStore:
                 code="invalid_approval_choice",
                 status=400,
             )
+        if _run_is_retired(run_id):
+            raise ProtectedApprovalError(
+                "Protected API run has retired", code="approval_run_retired"
+            )
         key = (run_id, approval_session, request_id)
-        with self._lock:
-            record = self._records.get(key)
-            if record is None:
+        with _ACTIVE_STORE_LOCK:
+            if _run_is_retired(run_id):
                 raise ProtectedApprovalError(
-                    "Protected approval request is not pending",
-                    code="approval_not_pending",
+                    "Protected API run has retired", code="approval_run_retired"
                 )
-            if record.consumed:
-                if record.failure_message == "Protected approval expired":
+            with self._lock:
+                record = self._records.get(key)
+                if record is None:
+                    raise ProtectedApprovalError(
+                        "Protected approval request is not pending",
+                        code="approval_not_pending",
+                    )
+                if record.consumed:
+                    if record.failure_message == "Protected approval expired":
+                        raise ProtectedApprovalError("Protected approval request expired", code="approval_expired")
+                    raise ProtectedApprovalError("Protected approval request was already used", code="approval_replayed")
+                if float(self._clock()) >= record.expires_at:
+                    self._expire_locked(record)
                     raise ProtectedApprovalError("Protected approval request expired", code="approval_expired")
-                raise ProtectedApprovalError("Protected approval request was already used", code="approval_replayed")
-            if float(self._clock()) >= record.expires_at:
-                self._expire_locked(record)
-                raise ProtectedApprovalError("Protected approval request expired", code="approval_expired")
-            if not hmac.compare_digest(record.action_digest, action_digest):
-                raise ProtectedApprovalError(
-                    "Protected approval action digest does not match the pending action",
-                    code="approval_action_mismatch",
-                )
-            record.choice = choice
-            record.consumed = True
-            self._remove_record_locked(record)
-            record.event.set()
-            return {
-                "object": "hermes.protected_api_run_approval",
-                "run_id": record.run_id,
-                "approval_session": record.approval_session,
-                "request_id": record.request_id,
-                "action_digest": record.action_digest,
-                "choice": choice,
-                "resolved": 1,
-            }
+                if not hmac.compare_digest(record.action_digest, action_digest):
+                    raise ProtectedApprovalError(
+                        "Protected approval action digest does not match the pending action",
+                        code="approval_action_mismatch",
+                    )
+                record.choice = choice
+                record.consumed = True
+                self._remove_record_locked(record)
+                record.event.set()
+                return {
+                    "object": "hermes.protected_api_run_approval",
+                    "run_id": record.run_id,
+                    "approval_session": record.approval_session,
+                    "request_id": record.request_id,
+                    "action_digest": record.action_digest,
+                    "choice": choice,
+                    "resolved": 1,
+                }
 
     def approve(
         self,
@@ -803,10 +823,8 @@ class ProtectedApiRunApprovalStore:
             run_id=run_id, approval_session=approval_session, body=body
         )
 
-    def retire_run(self, run_id: str, approval_session: Optional[str] = None) -> None:
-        """Fail closed and forget policy bindings when an API run retires."""
-        _mark_policy_retired(run_id, approval_session)
-        _clear_current_run_authorization(run_id, approval_session)
+    def _retire_run_state(self, run_id: str, approval_session: Optional[str] = None) -> None:
+        """Remove policy generations and wake their waiters without marking tombstones."""
         with _ACTIVE_STORE_LOCK:
             with self._lock:
                 keys = [
@@ -817,8 +835,20 @@ class ProtectedApiRunApprovalStore:
                     self._policies.pop(key, None)
                     _untrack_active_store(key, self)
                 for record in list(self._records.values()):
-                    if record.run_id == run_id and (approval_session is None or record.approval_session == approval_session):
+                    if record.run_id == run_id and (
+                        approval_session is None or record.approval_session == approval_session
+                    ):
                         self._expire_locked(record, message="Protected API run retired")
+
+    def _force_retire_run(self, run_id: str, approval_session: Optional[str] = None) -> None:
+        """Repair state after an adapter-specific ``retire_run`` failure."""
+        _mark_policy_retired(run_id, approval_session)
+        _clear_current_run_authorization(run_id, approval_session)
+        ProtectedApiRunApprovalStore._retire_run_state(self, run_id, approval_session)
+
+    def retire_run(self, run_id: str, approval_session: Optional[str] = None) -> None:
+        """Fail closed and forget policy bindings when an API run retires."""
+        self._force_retire_run(run_id, approval_session)
 
 
 _DEFAULT_STORE = ProtectedApiRunApprovalStore()
@@ -988,6 +1018,16 @@ def attach_protected_api_run_policy(
     return binding
 
 
+def _force_retire_store(store: Any, run_id: str, approval_session: Optional[str]) -> None:
+    """Run the built-in state cleanup without re-entering a failing override."""
+    if isinstance(store, ProtectedApiRunApprovalStore):
+        ProtectedApiRunApprovalStore._force_retire_run(store, run_id, approval_session)
+        return
+    force_retire = getattr(store, "_force_retire_run", None)
+    if callable(force_retire):
+        force_retire(run_id, approval_session)
+
+
 @contextmanager
 def bind_protected_api_run(
     policy: ProtectedApiRunApprovalPolicy,
@@ -1017,10 +1057,26 @@ def bind_protected_api_run(
         )
         yield binding
     finally:
-        # This convenience context owns the local run lifecycle. The API
-        # server instead calls retire_protected_api_run when its task retires.
-        target_store.retire_run(target_run, target_session)
-        reset_current_api_run_context(context_tokens)
+        retirement_error = None
+        try:
+            # This convenience context owns the local run lifecycle. The API
+            # server instead calls retire_protected_api_run when its task retires.
+            target_store.retire_run(target_run, target_session)
+        except BaseException as exc:
+            retirement_error = exc
+            try:
+                _force_retire_store(target_store, target_run, target_session)
+            except BaseException as cleanup_error:
+                try:
+                    exc.add_note(f"protected store cleanup also failed: {cleanup_error!r}")
+                except BaseException:
+                    pass
+        finally:
+            # Context teardown is independent of store retirement. A failing
+            # adapter override must not leave authorization in the caller.
+            reset_current_api_run_context(context_tokens)
+        if retirement_error is not None:
+            raise retirement_error
 
 
 def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
@@ -1170,6 +1226,8 @@ def clear_current_protected_dispatch_authorization() -> None:
 
 
 def _binding_is_active(binding: ProtectedApiRunBinding) -> bool:
+    if binding.policy.run_id is None or _run_is_retired(binding.policy.run_id):
+        return False
     try:
         return bool(binding.store.is_binding_current(binding))
     except Exception:
@@ -1317,6 +1375,8 @@ def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consum
 
 def is_protected_api_run(run_id: str, approval_session: Optional[str] = None) -> bool:
     """Return whether any active protected policy owns the run."""
+    if _run_is_retired(run_id):
+        return False
     return bool(_active_stores_for(run_id, approval_session))
 
 
@@ -1324,6 +1384,10 @@ def protected_api_run_status_payload(
     run_id: str, approval_session: str, request_id: str
 ) -> Dict[str, Any]:
     """Build the protected approval status from the server-held pending record."""
+    if _run_is_retired(run_id):
+        raise ProtectedApprovalError(
+            "Protected API run has retired", code="approval_run_retired"
+        )
     stores = _active_stores_for(run_id, approval_session)
     if not stores:
         stores = (_DEFAULT_STORE,)
@@ -1348,6 +1412,10 @@ def submit_protected_api_approval(
     *, run_id: str, approval_session: str, body: Mapping[str, Any]
 ) -> Dict[str, Any]:
     """Resolve a strict API approval on the run's active policy store."""
+    if _run_is_retired(run_id):
+        raise ProtectedApprovalError(
+            "Protected API run has retired", code="approval_run_retired"
+        )
     stores = _active_stores_for(run_id, approval_session)
     if not stores:
         return _DEFAULT_STORE.submit_approval(
@@ -1366,9 +1434,54 @@ def submit_protected_api_approval(
 
 def retire_protected_api_run(run_id: str, approval_session: Optional[str] = None) -> None:
     """Retire every active policy store for a protected run."""
-    _mark_run_retired(run_id)
+    _mark_run_retired(run_id, approval_session)
+    _mark_policy_retired(run_id, approval_session)
     _clear_current_run_authorization(run_id, approval_session)
-    stores = set(_active_stores_for(run_id, approval_session))
-    stores.add(_DEFAULT_STORE)
+
+    stores = []
+    for store in _active_stores_for(run_id, approval_session):
+        if not any(existing is store for existing in stores):
+            stores.append(store)
+    context = _CURRENT_API_RUN_CONTEXT.get()
+    bindings = (_CURRENT_BINDING.get(), context.protected_binding if context is not None else None)
+    for binding in bindings:
+        if binding is None:
+            continue
+        policy = binding.policy
+        if policy.run_id != run_id or (
+            approval_session is not None and policy.approval_session != approval_session
+        ):
+            continue
+        if not any(existing is binding.store for existing in stores):
+            stores.append(binding.store)
+    if not any(existing is _DEFAULT_STORE for existing in stores):
+        stores.append(_DEFAULT_STORE)
+
+    failures = []
     for store in stores:
-        store.retire_run(run_id, approval_session)
+        try:
+            store.retire_run(run_id, approval_session)
+        except BaseException as exc:
+            failures.append(exc)
+            try:
+                # A custom override may fail before reaching the built-in
+                # ledger cleanup. Repair the state directly so records wake and
+                # stale policy generations cannot accept late approvals.
+                _force_retire_store(store, run_id, approval_session)
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+                try:
+                    exc.add_note(f"protected store cleanup also failed: {cleanup_error!r}")
+                except BaseException:
+                    pass
+
+    if failures:
+        primary = failures[0]
+        for secondary in failures[1:]:
+            if secondary is primary:
+                continue
+            try:
+                primary.add_note(f"additional protected retirement failure: {secondary!r}")
+            except BaseException:
+                pass
+        raise primary

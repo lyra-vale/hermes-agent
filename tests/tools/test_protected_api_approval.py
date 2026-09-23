@@ -38,6 +38,19 @@ def _action(path="/calendar/event.json", content="approved"):
     return {"path": path, "content": content}
 
 
+class _RetireFailureStore(protected.ProtectedApiRunApprovalStore):
+    def __init__(self, *, fail_retire=True):
+        super().__init__()
+        self.fail_retire = fail_retire
+        self.retire_calls = []
+
+    def retire_run(self, run_id, approval_session=None):
+        self.retire_calls.append((run_id, approval_session))
+        if self.fail_retire:
+            raise RuntimeError("custom store retirement failed")
+        return super().retire_run(run_id, approval_session)
+
+
 def _protected_event(events):
     assert events
     event = events[0]
@@ -227,6 +240,180 @@ def test_attached_non_default_store_remains_visible_to_api_resolution():
         worker.join(timeout=2)
 
     assert result["approved"] is True
+
+
+def test_retirement_attempts_all_active_stores_after_custom_store_failure():
+    run_id = "run_custom_retire_all_stores"
+    approval_session = "approval_custom_retire_all_stores"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    first = _RetireFailureStore()
+    second = _RetireFailureStore()
+    first.register_policy(policy)
+    second.register_policy(policy)
+
+    try:
+        with pytest.raises(RuntimeError, match="custom store retirement failed"):
+            protected.retire_protected_api_run(run_id, approval_session)
+
+        assert first.retire_calls == [(run_id, approval_session)]
+        assert second.retire_calls == [(run_id, approval_session)]
+        assert not first.is_protected_run(run_id, approval_session)
+        assert not second.is_protected_run(run_id, approval_session)
+        assert not protected.is_protected_api_run(run_id, approval_session)
+    finally:
+        for store in (first, second):
+            store.fail_retire = False
+            store.retire_run(run_id, approval_session)
+
+
+def test_bind_resets_context_and_binding_when_custom_retirement_raises():
+    run_id = "run_custom_bind_cleanup"
+    approval_session = "approval_custom_bind_cleanup"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    store = _RetireFailureStore()
+
+    try:
+        with pytest.raises(RuntimeError, match="custom store retirement failed"):
+            with protected.bind_protected_api_run(policy, store=store):
+                assert protected.protected_api_run_context_active()
+                assert protected._CURRENT_BINDING.get() is not None
+
+        assert protected._CURRENT_API_RUN_CONTEXT.get() is None
+        assert protected._CURRENT_BINDING.get() is None
+        assert protected._CURRENT_AUTHORIZATION.get() is None
+        assert not store.is_protected_run(run_id, approval_session)
+    finally:
+        store.fail_retire = False
+        store.retire_run(run_id, approval_session)
+
+
+def test_retirement_wakes_pending_waiter_when_custom_store_retirement_raises():
+    run_id = "run_custom_retire_waiter"
+    approval_session = "approval_custom_retire_waiter"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    store = _RetireFailureStore()
+    events = []
+    result = {}
+    worker = None
+    tokens = protected.set_current_api_run_context(
+        run_id=run_id,
+        approval_session=approval_session,
+        pending_callback=events.append,
+    )
+    try:
+        protected.attach_protected_api_run_policy(
+            policy,
+            store=store,
+            pending_callback=events.append,
+        )
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+
+        with pytest.raises(RuntimeError, match="custom store retirement failed"):
+            protected.retire_protected_api_run(run_id, approval_session)
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result["approved"] is False
+        assert "retired" in result["message"].lower()
+        assert store.pending_record_count == 0
+    finally:
+        store.fail_retire = False
+        store.retire_run(run_id, approval_session)
+        if worker is not None:
+            worker.join(timeout=2)
+        protected.reset_current_api_run_context(tokens)
+
+
+def test_retired_custom_store_rejects_late_approval_and_dispatch():
+    run_id = "run_custom_retire_stale_approval"
+    approval_session = "approval_custom_retire_stale_approval"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    store = _RetireFailureStore()
+    events = []
+    result = {}
+    worker = None
+    tokens = protected.set_current_api_run_context(
+        run_id=run_id,
+        approval_session=approval_session,
+        pending_callback=events.append,
+    )
+    try:
+        binding = protected.attach_protected_api_run_policy(
+            policy,
+            store=store,
+            pending_callback=events.append,
+        )
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+
+        with pytest.raises(RuntimeError, match="custom store retirement failed"):
+            protected.retire_protected_api_run(run_id, approval_session)
+
+        with pytest.raises(protected.ProtectedApprovalError) as exc:
+            protected.submit_protected_api_approval(
+                run_id=run_id,
+                approval_session=approval_session,
+                body={
+                    "request_id": events[0]["request_id"],
+                    "action_digest": events[0]["action_digest"],
+                    "choice": "once",
+                },
+            )
+        assert exc.value.code == "approval_run_retired"
+        assert not binding.store.is_binding_current(binding)
+        assert not protected.is_protected_api_run(run_id, approval_session)
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result["approved"] is False
+    finally:
+        store.fail_retire = False
+        store.retire_run(run_id, approval_session)
+        if worker is not None:
+            worker.join(timeout=2)
+        protected.reset_current_api_run_context(tokens)
+
+
+def test_custom_store_recovers_for_a_later_run_after_failed_retirement():
+    store = _RetireFailureStore()
+    first_run_id = "run_custom_retire_recovery_first"
+    first_approval_session = "approval_custom_retire_recovery_first"
+    second_run_id = "run_custom_retire_recovery_second"
+    second_approval_session = "approval_custom_retire_recovery_second"
+    first = _policy(run_id=first_run_id, approval_session=first_approval_session)
+    second = _policy(run_id=second_run_id, approval_session=second_approval_session)
+    store.register_policy(first)
+
+    try:
+        with pytest.raises(RuntimeError, match="custom store retirement failed"):
+            protected.retire_protected_api_run(first_run_id, first_approval_session)
+
+        assert not store.is_protected_run(first_run_id, first_approval_session)
+
+        store.fail_retire = False
+        store.register_policy(second)
+        assert store.is_protected_run(second_run_id, second_approval_session)
+        protected.retire_protected_api_run(second_run_id, second_approval_session)
+        assert not store.is_protected_run(second_run_id, second_approval_session)
+    finally:
+        store.fail_retire = False
+        store.retire_run(first_run_id, first_approval_session)
+        store.retire_run(second_run_id, second_approval_session)
 
 
 def test_registered_policy_is_not_silently_bypassed_by_core_gate():
