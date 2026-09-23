@@ -232,9 +232,21 @@ class PluginLedgerMixin:
         if unload_all:
             target_keys = set(self._ownership_ledger) | set(self._plugins)
             registrations = list(self._registration_order)
+            removed_subscriptions = sum(
+                len(entries) for entries in self._subscriptions.values()
+            )
+            self._invalidate_event_dispatch(clear_subscriptions=True)
         else:
-            target_keys = self._unload_target_keys(self._resolve_plugin_key(plugin))
+            requested_key = self._resolve_plugin_key(plugin)
+            target_keys = self._unload_target_keys(requested_key)
             registrations = [r for r in self._registration_order if r.plugin_key in target_keys]
+            removed_subscriptions = self._remove_plugin_subscriptions(requested_key)
+            for key in target_keys - {requested_key}:
+                removed_subscriptions += self._remove_plugin_subscriptions(key)
+            # Invalidate every queued envelope, including one already
+            # snapshotted before owner removal. The generation boundary is
+            # cheaper and safer than trying to rewrite immutable envelopes.
+            self._invalidate_event_dispatch()
             # Persistent registrations are absent from _registration_order (unload-all keeps them), but a
             # *targeted* unload is the disable/uninstall path: a disabled auth plugin's provider must NOT stay
             # live process-wide.
@@ -242,7 +254,7 @@ class PluginLedgerMixin:
             registrations.extend(
                 r for key in target_keys for r in self._ownership_ledger.get(key, []) if r.persistent and r.active
             )
-        found = bool(target_keys or registrations)
+        found = bool(target_keys or registrations or removed_subscriptions)
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
         if unload_all:

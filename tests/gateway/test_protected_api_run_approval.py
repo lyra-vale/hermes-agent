@@ -575,6 +575,70 @@ async def test_protected_tool_progress_preview_is_not_published():
 
 
 @pytest.mark.asyncio
+async def test_run_launch_drops_late_tool_events_after_terminal():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_id = "run_late_tool_event_lifecycle"
+    queue = asyncio.Queue()
+    adapter._run_streams[run_id] = queue
+    adapter._run_statuses[run_id] = {"object": "hermes.run", "run_id": run_id, "status": "running"}
+    run = api_server_runs._RunLaunch(
+        adapter, run_id, queue, "session", None, False, "message", [], False,
+        agent_kwargs={}, request_profile=None, browser_control_principal=None,
+        browser_control_transport_family=None,
+    )
+    callback = api_server_runs._make_run_event_callback(
+        adapter, run_id, asyncio.get_running_loop(), _api_server=api_server_module, run=run,
+    )
+
+    assert run.mark_terminal() is True
+    callback("tool.started", "write_file", "/calendar/late-event.json secret")
+    await asyncio.sleep(0)
+
+    assert queue.empty()
+    assert run.put_event({"event": "message.delta", "delta": "late-secret"}) is False
+    run.retire()
+    assert run.put_event({"event": "message.delta", "delta": "retired-secret"}) is False
+
+
+@pytest.mark.asyncio
+async def test_execute_run_drops_late_text_callback_after_retirement(monkeypatch):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_id = "run_late_text_callback_lifecycle"
+    queue = asyncio.Queue()
+    adapter._run_streams[run_id] = queue
+    adapter._run_statuses[run_id] = {"object": "hermes.run", "run_id": run_id, "status": "queued"}
+    run = api_server_runs._RunLaunch(
+        adapter, run_id, queue, "session", None, False, "message", [], False,
+        agent_kwargs={}, request_profile=None, browser_control_principal=None,
+        browser_control_transport_family=None,
+    )
+    captured = {}
+
+    class FakeAgent:
+        pass
+
+    def create_agent(**kwargs):
+        captured["text_callback"] = kwargs["stream_delta_callback"]
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", create_agent)
+    monkeypatch.setattr(
+        api_server_runs,
+        "_run_agent_sync",
+        lambda *_args, **_kwargs: ({"final_response": "done"}, {}),
+    )
+
+    await api_server_runs._execute_run(adapter, run, _api_server=api_server_module)
+    captured["text_callback"]("late-text-secret")
+    await asyncio.sleep(0)
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert not any(event.get("event") == "message.delta" for event in events if event is not None)
+
+
+@pytest.mark.asyncio
 async def test_real_api_run_lifecycle_admission_executor_status_and_stop(monkeypatch):
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     run_started = threading.Event()

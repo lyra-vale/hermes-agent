@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli.plugins import (
     _EVENT_EMIT_DEPTH_CAP,
+    LoadedPlugin,
     PluginContext,
     PluginManager,
     PluginManifest,
@@ -405,6 +406,105 @@ def test_owner_removal_cancels_callback_already_snapshotted_in_queue():
     _drain(manager)
 
     assert observed == []
+
+
+def test_public_unload_cancels_target_subscriptions_and_queued_callbacks():
+    manager = _fresh_manager()
+    ctx_gate = _make_ctx(manager, "gate", key="gate")
+    ctx_target = _make_ctx(manager, "plugin_a", key="plugin_a")
+    ctx_emitter = _make_ctx(manager, "plugin_b", key="plugin_b")
+    manager._plugins["plugin_a"] = LoadedPlugin(
+        manifest=ctx_target.manifest, enabled=True,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    def blocking(**_payload):
+        entered.set()
+        release.wait(timeout=2.0)
+
+    ctx_gate.subscribe("plugin_b:ping", blocking)
+    ctx_target.subscribe("plugin_b:ping", lambda **payload: observed.append(payload))
+    generation = manager._event_generation
+    assert ctx_emitter.emit("ping", {"value": 1}) == 2
+    assert entered.wait(timeout=1.0)
+
+    assert manager.unload("plugin_a") is True
+    release.set()
+    _drain(manager)
+
+    assert manager._event_generation > generation
+    assert observed == []
+    assert all(entry.owner != "plugin_a" for entries in manager._subscriptions.values() for entry in entries)
+
+
+def test_public_unload_all_clears_event_queue_and_advances_generation():
+    manager = _fresh_manager()
+    ctx_gate = _make_ctx(manager, "gate", key="gate")
+    ctx_target = _make_ctx(manager, "plugin_a", key="plugin_a")
+    ctx_emitter = _make_ctx(manager, "plugin_b", key="plugin_b")
+    manager._plugins["plugin_a"] = LoadedPlugin(
+        manifest=ctx_target.manifest, enabled=True,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    def blocking(**_payload):
+        entered.set()
+        release.wait(timeout=2.0)
+
+    ctx_gate.subscribe("plugin_b:ping", blocking)
+    ctx_target.subscribe("plugin_b:ping", lambda **payload: observed.append(payload))
+    generation = manager._event_generation
+    assert ctx_emitter.emit("ping", {"value": 1}) == 2
+    assert entered.wait(timeout=1.0)
+
+    assert manager.unload() is True
+    release.set()
+    _drain(manager)
+
+    assert manager._event_generation > generation
+    assert manager._subscriptions == {}
+    assert manager._event_queue.empty()
+    assert observed == []
+
+
+def test_protected_subscriber_hook_and_middleware_logs_hide_exception_text(caplog):
+    from tools import protected_api_approval as protected
+    import time
+
+    manager = _fresh_manager()
+    ctx_subscriber = _make_ctx(manager, "subscriber", key="subscriber")
+    ctx_emitter = _make_ctx(manager, "emitter", key="emitter")
+    raw = "/calendar/private-event.json protected-payload-secret"
+
+    def broken(**_payload):
+        raise RuntimeError(raw)
+
+    ctx_subscriber.subscribe("emitter:ping", broken)
+    manager._hooks["on_session_end"] = [broken]
+    manager._middleware["tool_request"] = [broken]
+    policy = protected.ProtectedApiRunApprovalPolicy(
+        allowed_tool_names=("write_file",),
+        run_id="plugin-protected-log-run",
+        approval_session="plugin-protected-log-session",
+        user_session_id="plugin-protected-log-user",
+        hermes_session_id="plugin-protected-log-hermes",
+        conversation_id="plugin-protected-log-conversation",
+        expires_at=time.time() + 30,
+    )
+
+    with protected.bind_protected_api_run(policy):
+        with caplog.at_level(logging.WARNING):
+            ctx_emitter.emit("ping", {"args": {"path": raw}})
+            _drain(manager)
+            manager.invoke_hook("on_session_end", args={"path": raw})
+            manager.invoke_middleware("tool_request", args={"path": raw})
+
+    assert raw not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 # ── 5. Recursion cap ─────────────────────────────────────────────────────────

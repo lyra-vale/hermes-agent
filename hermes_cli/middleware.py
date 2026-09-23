@@ -13,6 +13,15 @@ from typing import Any, Callable, Dict, List
 
 logger = logging.getLogger(__name__)
 
+
+def _callback_exception_diagnostic(operation: str, exc: BaseException) -> str:
+    """Describe middleware failures without exposing protected action payloads."""
+    try:
+        from tools.protected_api_approval import protected_exception_diagnostic
+        return protected_exception_diagnostic(operation, exc)
+    except BaseException:
+        return f"{type(exc).__name__}"
+
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
 
@@ -56,7 +65,10 @@ def _safe_copy(payload: Any) -> Any:
     try:
         return deepcopy(payload)
     except Exception as exc:  # pragma: no cover - exercised via fallback test
-        logger.debug("deepcopy failed for request payload (%s); using shallow copy", exc)
+        logger.debug(
+            "deepcopy failed for request payload (%s); using shallow copy",
+            _callback_exception_diagnostic("middleware payload copy", exc),
+        )
         return dict(payload) if isinstance(payload, dict) else payload
 
 
@@ -203,7 +215,8 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
         except Exception as exc:
             logger.warning(
                 "Middleware '%s' callback %s raised: %s",
-                kind, getattr(callback, "__name__", repr(callback)), exc)
+                kind, getattr(callback, "__name__", repr(callback)),
+                _callback_exception_diagnostic(kind, exc))
             if next_succeeded:
                 return next_result
             if next_called:

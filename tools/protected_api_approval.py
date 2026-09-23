@@ -173,6 +173,10 @@ class _ApiRunContext:
     run_id: str
     approval_session: str
     pending_callback: Optional[Callable[[Dict[str, Any]], None]]
+    # Context copies outlive the ledger entry that created them. Retain the
+    # exact policy generation in the copied context so bounded tombstones are
+    # not the only evidence that this worker is protected.
+    protected_binding: Optional[ProtectedApiRunBinding] = None
 
 
 @dataclass
@@ -829,10 +833,25 @@ def set_current_api_run_context(
     """Bind the API-run identity used by a profile-local adapter."""
     _validate_identity(run_id, "run_id")
     _validate_identity(approval_session, "approval_session")
+    previous_context = _CURRENT_API_RUN_CONTEXT.get()
+    previous_binding = _CURRENT_BINDING.get()
+    retained_binding = None
+    for candidate in (
+        previous_context.protected_binding if previous_context is not None else None,
+        previous_binding,
+    ):
+        if candidate is not None and (
+            candidate.policy.run_id == run_id and candidate.policy.approval_session == approval_session
+        ):
+            # Deliberately retain both active and stale generations. A copied
+            # worker may reset its identity after retirement; dropping this
+            # evidence would turn the same known run into generic dispatch.
+            retained_binding = candidate
+            break
     context_token = _CURRENT_API_RUN_CONTEXT.set(
-        _ApiRunContext(run_id, approval_session, pending_callback)
+        _ApiRunContext(run_id, approval_session, pending_callback, retained_binding)
     )
-    binding_token = _CURRENT_BINDING.set(None)
+    binding_token = _CURRENT_BINDING.set(retained_binding)
     authorization_token = _CURRENT_AUTHORIZATION.set(None)
     return context_token, binding_token, authorization_token
 
@@ -858,7 +877,20 @@ def _clear_attachment_state_on_failure(function):
             return function(*args, **kwargs)
         except BaseException:
             _CURRENT_AUTHORIZATION.set(None)
-            _CURRENT_BINDING.set(None)
+            # Keep a stale generation available to observer/dispatch callers;
+            # clearing it would make the next lookup indistinguishable from a
+            # legacy unprotected call. Fresh/active bindings are cleared so a
+            # failed replacement cannot retain an authorization token.
+            binding = _CURRENT_BINDING.get()
+            if binding is None or _binding_is_active(binding):
+                _CURRENT_BINDING.set(None)
+                context = _CURRENT_API_RUN_CONTEXT.get()
+                if context is not None and (
+                    context.protected_binding is None or _binding_is_active(context.protected_binding)
+                ):
+                    _CURRENT_API_RUN_CONTEXT.set(
+                        _ApiRunContext(context.run_id, context.approval_session, context.pending_callback)
+                    )
             raise
     return wrapped
 
@@ -876,7 +908,6 @@ def attach_protected_api_run_policy(
     _CURRENT_AUTHORIZATION.set(None)
     target_store = store or _DEFAULT_STORE
     context = _CURRENT_API_RUN_CONTEXT.get()
-    context_created = False
     if context is None:
         if not policy.run_id or not policy.approval_session:
             raise ProtectedApprovalError(
@@ -884,7 +915,28 @@ def attach_protected_api_run_policy(
                 code="approval_context_missing",
             )
         context = _ApiRunContext(policy.run_id, policy.approval_session, pending_callback)
-        context_created = True
+    def _require_live_context_binding(existing: Optional[ProtectedApiRunBinding]) -> None:
+        if existing is None:
+            return
+        try:
+            active = existing.store.is_binding_current(existing)
+        except BaseException as exc:
+            raise ProtectedApprovalError(
+                "Protected API run context could not be verified",
+                code="approval_context_unavailable",
+                status=500,
+            ) from exc
+        if not active:
+            raise ProtectedApprovalError(
+                "Protected API run context has retired",
+                code="approval_context_retired",
+            )
+
+    # Validate copied context evidence before touching the store. Otherwise a
+    # stale worker could re-register an equal policy after its bounded global
+    # tombstone has been evicted, then fail only after reviving the ledger.
+    _require_live_context_binding(context.protected_binding)
+    _require_live_context_binding(_CURRENT_BINDING.get())
     if _run_is_retired(context.run_id):
         _CURRENT_AUTHORIZATION.set(None)
         raise ProtectedApprovalError(
@@ -902,23 +954,36 @@ def attach_protected_api_run_policy(
             status=500,
         )
     current = _CURRENT_BINDING.get()
-    if current is not None:
-        try:
-            current_active = current.store.is_binding_current(current)
-        except Exception:
-            current_active = False
-        if not current_active:
-            _CURRENT_AUTHORIZATION.set(None)
-            _CURRENT_BINDING.set(None)
-            current = None
     if current is not None and current != binding:
         _CURRENT_AUTHORIZATION.set(None)
         raise ProtectedApprovalError(
             "A different protected policy is already active in this API-run context",
             code="approval_policy_conflict",
         )
-    if context_created:
-        _CURRENT_API_RUN_CONTEXT.set(context)
+    if context.protected_binding is not None:
+        try:
+            if not context.protected_binding.store.is_binding_current(context.protected_binding):
+                _CURRENT_AUTHORIZATION.set(None)
+                raise ProtectedApprovalError(
+                    "Protected API run context has retired",
+                    code="approval_context_retired",
+                )
+        except ProtectedApprovalError:
+            raise
+        except BaseException:
+            _CURRENT_AUTHORIZATION.set(None)
+            raise ProtectedApprovalError(
+                "Protected API run context could not be verified",
+                code="approval_context_unavailable",
+                status=500,
+            )
+    context = _ApiRunContext(
+        context.run_id,
+        context.approval_session,
+        callback,
+        binding,
+    )
+    _CURRENT_API_RUN_CONTEXT.set(context)
     _CURRENT_BINDING.set(binding)
     return binding
 
@@ -960,20 +1025,38 @@ def bind_protected_api_run(
 
 def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
     """Resolve a policy registered for the current API run before generic fallback."""
+    context = _CURRENT_API_RUN_CONTEXT.get()
     binding = _CURRENT_BINDING.get()
     if binding is not None:
         try:
             if binding.store.is_binding_current(binding):
+                if (
+                    context is not None
+                    and context.protected_binding is None
+                    and context.run_id == binding.policy.run_id
+                    and context.approval_session == binding.policy.approval_session
+                ):
+                    _CURRENT_API_RUN_CONTEXT.set(
+                        _ApiRunContext(
+                            context.run_id,
+                            context.approval_session,
+                            context.pending_callback,
+                            binding,
+                        )
+                    )
                 return binding
         except Exception:
             pass
-        # A retired or replaced generation must never carry its token into a
-        # later equal-policy registration in the same copied context.
+        # Preserve the stale generation in the ContextVar. Returning ``None``
+        # here makes observer callers fall through to raw payloads, while a
+        # stale binding is still enough evidence to redact and fail closed.
         _CURRENT_AUTHORIZATION.set(None)
-        _CURRENT_BINDING.set(None)
-    context = _CURRENT_API_RUN_CONTEXT.get()
+        return binding
     if context is None:
         return None
+    if context.protected_binding is not None:
+        _CURRENT_BINDING.set(context.protected_binding)
+        return context.protected_binding
     stores = _active_stores_for(context.run_id, context.approval_session)
     if not stores:
         return None
@@ -989,6 +1072,9 @@ def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
     if binding.pending_callback is None and context.pending_callback is not None:
         stores[0].register_policy(binding.policy, pending_callback=context.pending_callback)
         binding = ProtectedApiRunBinding(binding.policy, stores[0], context.pending_callback, binding.policy_epoch)
+    _CURRENT_API_RUN_CONTEXT.set(
+        _ApiRunContext(context.run_id, context.approval_session, context.pending_callback, binding)
+    )
     _CURRENT_BINDING.set(binding)
     return binding
 
@@ -1111,6 +1197,14 @@ def require_protected_api_run_approval(
         binding = _resolve_current_protected_binding()
     except Exception:
         return blocked("BLOCKED: protected policy resolution failed")
+    context = _CURRENT_API_RUN_CONTEXT.get()
+    if binding is None and context is not None and _run_has_redaction_tombstone(
+        context.run_id, context.approval_session
+    ):
+        # Check the retirement marker before a caller-supplied policy can
+        # attach. Otherwise a stale worker could use the policy argument to
+        # revive a known protected run after its original store was retired.
+        return blocked("BLOCKED: protected API run has retired")
     if policy is not None:
         if binding is None:
             try:
@@ -1131,7 +1225,11 @@ def require_protected_api_run_approval(
         # A stale token must not survive a legacy/no-policy early return.
         clear_current_protected_dispatch_authorization()
         context = _CURRENT_API_RUN_CONTEXT.get()
-        if context is not None and _run_is_retired(context.run_id):
+        if context is not None and (
+            context.protected_binding is not None
+            or _run_is_retired(context.run_id)
+            or _run_has_redaction_tombstone(context.run_id, context.approval_session)
+        ):
             return blocked("BLOCKED: protected API run has retired")
         return {"approved": True, "protected": False}
     if not _binding_is_active(binding):

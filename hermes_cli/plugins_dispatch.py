@@ -141,6 +141,18 @@ _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
 
 
+def _callback_exception_diagnostic(operation: str, exc: BaseException) -> str:
+    """Describe a callback failure without exposing protected payload text."""
+    try:
+        from tools.protected_api_approval import protected_exception_diagnostic
+        return protected_exception_diagnostic(operation, exc)
+    except BaseException:
+        # A security helper/import failure must not turn a diagnostic into a
+        # raw exception string. The callback name and exception type remain
+        # useful without copying arbitrary action arguments into logs.
+        return f"{type(exc).__name__}"
+
+
 def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     """Whether *hook_name* should run under the non-blocking timeout path."""
     if timeout <= 0 or hook_name in _HOOK_CALLER_THREAD_HOOKS:
@@ -212,7 +224,8 @@ class PluginDispatchMixin:
                     })
                 else:
                     logger.warning(
-                        "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                        "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)),
+                        _callback_exception_diagnostic(hook_name, exc))
         return results
 
     def _run_hook_callback_bounded(
@@ -262,7 +275,7 @@ class PluginDispatchMixin:
             _release_token()  # the runner's finally never runs when OS thread creation fails
             logger.warning(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
-                hook_name, callback_name, exc)
+                hook_name, callback_name, _callback_exception_diagnostic(hook_name, exc))
             return _HOOK_SKIPPED
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
             with self._hook_timeout_lock:
@@ -302,6 +315,39 @@ class PluginDispatchMixin:
                 else:
                     del self._subscriptions[event]
         return removed
+
+    def _invalidate_event_dispatch(self, *, clear_subscriptions: bool = False) -> None:
+        """Invalidate queued event work at a plugin lifecycle boundary.
+
+        A worker may already be inside one callback, but every queued envelope
+        belongs to the old generation and is discarded. The generation check
+        also makes an envelope already taken by the worker stop before its next
+        subscriber, so unload cannot run callbacks from a retired registry.
+        """
+        with self._event_lock:
+            old_generation = self._event_generation
+            self._event_generation += 1
+            new_generation = self._event_generation
+            self._event_pending_by_generation.setdefault(new_generation, 0)
+            if clear_subscriptions:
+                self._subscriptions.clear()
+            while True:
+                try:
+                    item = self._event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if item is not _EVENT_WORKER_STOP:
+                        pending = self._event_pending_by_generation.get(item.generation, 0)
+                        if pending > 0:
+                            self._event_pending_by_generation[item.generation] = pending - 1
+                finally:
+                    self._event_queue.task_done()
+            # Do not retain an unbounded trail of already-idle generations.
+            for generation, pending in list(self._event_pending_by_generation.items()):
+                if generation not in (old_generation, new_generation) and pending <= 0:
+                    self._event_pending_by_generation.pop(generation, None)
+            self._event_idle.notify_all()
 
     def _ensure_event_worker_locked(self) -> None:
         worker = self._event_worker
@@ -372,7 +418,8 @@ class PluginDispatchMixin:
                 except Exception as exc:
                     logger.warning(
                         "Event '%s' subscriber %s raised: %s", item.event,
-                        getattr(callback, "__name__", repr(callback)), exc)
+                        getattr(callback, "__name__", repr(callback)),
+                        _callback_exception_diagnostic(item.event, exc))
         finally:
             self._emit_depth.value = previous_depth
 
@@ -420,12 +467,13 @@ class PluginDispatchMixin:
             item = _QueuedPluginEvent(
                 event=event, payload=dict(payload), subscriptions=subscriptions, depth=depth + 1,
                 generation=generation, context=event_context)
+            self._event_pending_by_generation[generation] = pending + 1
             try:
                 self._event_queue.put_nowait(item)
             except queue.Full:
+                self._event_pending_by_generation[generation] = pending
                 logger.warning(budget_msg, _EVENT_PENDING_CAP, event)
                 return 0
-            self._event_pending_by_generation[generation] = pending + 1
             self._ensure_event_worker_locked()
             return len(subscriptions)
 
@@ -513,5 +561,6 @@ class PluginDispatchMixin:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
-                    "Middleware '%s' callback %s raised: %s", kind, getattr(cb, "__name__", repr(cb)), exc)
+                    "Middleware '%s' callback %s raised: %s", kind, getattr(cb, "__name__", repr(cb)),
+                    _callback_exception_diagnostic(kind, exc))
         return results

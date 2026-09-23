@@ -3894,8 +3894,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        return _api_runs._make_run_event_callback(self, run_id, loop, _api_server=sys.modules[__name__])
+    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, run=None):
+        return _api_runs._make_run_event_callback(
+            self, run_id, loop, _api_server=sys.modules[__name__], run=run)
 
     def _run_idempotency_scope(self, request: "web.Request") -> str:
         return _api_runs._run_idempotency_scope(self, request, _api_server=sys.modules[__name__])

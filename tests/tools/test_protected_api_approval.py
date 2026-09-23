@@ -353,6 +353,54 @@ def test_policy_retirement_redacts_run_without_active_context():
     assert protected.protected_api_run_redaction_active(run_id) is True
 
 
+def test_copied_protected_context_stays_fail_closed_after_tombstone_eviction(monkeypatch):
+    """A copied policy generation remains protected after bounded global markers rotate out."""
+    run_id = "copied-context-tombstone-eviction"
+    approval_session = "copied-context-tombstone-session"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    store = protected.ProtectedApiRunApprovalStore()
+    original_run_tombstones = dict(protected._RETIRED_RUN_TOMBSTONES)
+    original_policy_tombstones = dict(protected._RETIRED_POLICY_TOMBSTONES)
+    tokens = protected.set_current_api_run_context(
+        run_id=run_id, approval_session=approval_session,
+    )
+    try:
+        protected.attach_protected_api_run_policy(policy, store=store)
+        stale_context = contextvars.copy_context()
+        monkeypatch.setattr(protected, "MAX_RETIRED_RUN_TOMBSTONES", 1)
+        protected.retire_protected_api_run(run_id, approval_session)
+        protected.retire_protected_api_run("copied-context-eviction-marker")
+
+        result = {}
+
+        def probe():
+            inner_tokens = protected.set_current_api_run_context(
+                run_id=run_id, approval_session=approval_session,
+            )
+            try:
+                result["binding"] = protected.current_protected_api_run_binding()
+                result["observer"] = protected.safe_protected_observer_args(
+                    "write_file", _action("/calendar/copied-context.json", "stale-secret")
+                )
+                result["decision"] = protected.require_protected_api_run_approval(
+                    "write_file", _action("/calendar/copied-context.json", "stale-secret")
+                )
+            finally:
+                protected.reset_current_api_run_context(inner_tokens)
+        stale_context.run(probe)
+    finally:
+        protected.reset_current_api_run_context(tokens)
+        protected._RETIRED_RUN_TOMBSTONES.clear()
+        protected._RETIRED_RUN_TOMBSTONES.update(original_run_tombstones)
+        protected._RETIRED_POLICY_TOMBSTONES.clear()
+        protected._RETIRED_POLICY_TOMBSTONES.update(original_policy_tombstones)
+
+    assert result["binding"] is not None
+    assert result["observer"] == {}
+    assert result["decision"]["approved"] is False
+    assert "protected" in result["decision"]["message"].lower()
+
+
 def test_failed_policy_attachment_clears_binding_and_authorization(monkeypatch):
     store = protected.ProtectedApiRunApprovalStore()
     policy = _policy(run_id="run_attach_failure", approval_session="approval_attach_failure")

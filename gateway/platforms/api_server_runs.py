@@ -5,10 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -239,11 +240,35 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     return current
 
 
-def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
+def _make_run_event_callback(
+    self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server,
+    run: Optional["_RunLaunch"] = None,
+):
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: Dict[str, Any]) -> None:
+        if run is not None:
+            generation = run.callback_generation()
+            if generation is None:
+                return
+
+            def _deliver() -> None:
+                # The callback can be queued just before terminal transition;
+                # the generation check in put_event is the final admission
+                # boundary on the event loop.
+                if run.callback_generation() != generation:
+                    return
+                if run.put_event(event, generation=generation):
+                    self._set_run_status(
+                        run_id,
+                        self._run_statuses.get(run_id, {}).get("status", "running"),
+                        last_event=event.get("event"),
+                    )
+
+            with suppress(Exception):
+                loop.call_soon_threadsafe(_deliver)
+            return
         self._set_run_status(
             run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
         q = self._run_streams.get(run_id)
@@ -259,7 +284,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             safe_preview = preview
             try:
                 from tools.protected_api_approval import protected_api_run_redaction_active
-                protected_active = protected_api_run_redaction_active(run_id, run_id)
+                protected_active = protected_api_run_redaction_active(run_id)
                 if protected_active:
                     safe_preview = None
             except Exception:
@@ -270,7 +295,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         elif event_type in {"subagent.start", "subagent.complete"}:
             try:
                 from tools.protected_api_approval import protected_api_run_redaction_active
-                protected_active = protected_api_run_redaction_active(run_id, run_id)
+                protected_active = protected_api_run_redaction_active(run_id)
             except Exception:
                 protected_active = True
             event = _run_event(run_id, event_type)
@@ -441,16 +466,62 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     file_readonly_roots: Optional[tuple[str, ...]] = None  # captured server-owned roots for this run
+    _lifecycle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _terminal: bool = field(default=False, init=False, repr=False)
+    _retired: bool = field(default=False, init=False, repr=False)
+    _event_generation: int = field(default=0, init=False, repr=False)
 
     @property
     def approval_session_key(self) -> str:
         # Isolated per run: session ids are conversation scopes, not authorization namespaces.
         return self.run_id
 
-    def put_event(self, event: Optional[Dict]) -> None:
-        """Enqueue only while this run still owns live transport state."""
-        if self.owner._run_streams.get(self.run_id) is self.queue:
-            self.queue.put_nowait(event)
+    def callback_generation(self) -> Optional[int]:
+        """Return the live event generation, or ``None`` after terminal/retirement."""
+        with self._lifecycle_lock:
+            if self._terminal or self._retired:
+                return None
+            return self._event_generation
+
+    @property
+    def event_generation(self) -> int:
+        with self._lifecycle_lock:
+            return self._event_generation
+
+    def mark_terminal(self) -> bool:
+        """Close callback admission and advance the generation exactly once."""
+        with self._lifecycle_lock:
+            if self._terminal or self._retired:
+                return False
+            self._terminal = True
+            self._event_generation += 1
+            return True
+
+    def retire(self) -> None:
+        """Permanently reject callbacks after the run's transport lifecycle ends."""
+        with self._lifecycle_lock:
+            if self._retired:
+                return
+            self._retired = True
+            self._terminal = True
+            self._event_generation += 1
+
+    def put_event(
+        self, event: Optional[Dict], generation: Optional[int] = None, *, allow_terminal: bool = False,
+    ) -> bool:
+        """Enqueue only for the live queue and matching lifecycle generation."""
+        with self._lifecycle_lock:
+            if self._retired or (self._terminal and not allow_terminal):
+                return False
+            if generation is not None and generation != self._event_generation:
+                return False
+            if self.owner._run_streams.get(self.run_id) is not self.queue:
+                return False
+            try:
+                self.queue.put_nowait(event)
+            except Exception:
+                return False
+            return True
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -813,6 +884,30 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
+    def _publish(event: Dict[str, Any]) -> None:
+        generation_fn = getattr(run, "callback_generation", None)
+        put_event = getattr(run, "put_event", None)
+        if callable(generation_fn) and callable(put_event):
+            generation = generation_fn()
+            if generation is None:
+                return
+
+            def _deliver() -> None:
+                if run.callback_generation() != generation:
+                    return
+                self._set_run_status(
+                    run_id, "waiting_for_approval", last_event="approval.request", approval=event)
+                run.put_event(event, generation=generation)
+
+            with suppress(Exception):
+                loop.call_soon_threadsafe(_deliver)
+            return
+        # Compatibility for narrow adapter test doubles that predate the
+        # lifecycle-aware _RunLaunch object.
+        self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
+        with suppress(Exception):
+            loop.call_soon_threadsafe(q.put_nowait, event)
+
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
         event = dict(approval_data or {})
         if event.get("approval_type") == "protected_api_run":
@@ -838,9 +933,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             }
             event["choices"] = ["once", "deny"]
             event.update(_run_event(run_id, "approval.request", choices=["once", "deny"]))
-            self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
-            with suppress(Exception):
-                loop.call_soon_threadsafe(q.put_nowait, event)
+            _publish(event)
             return
         # Clients must never receive the raw flagged command: redact before it hits the stream.
         # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
@@ -853,9 +946,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             smart_denied=bool(event.get("smart_denied")),
             allow_session=event.get("allow_session") is not False,
             allow_permanent=event.get("allow_permanent") is not False)))
-        self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
-        with suppress(Exception):
-            loop.call_soon_threadsafe(q.put_nowait, event)
+        _publish(event)
 
     return _approval_notify
 
@@ -866,17 +957,27 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     run_id, loop = run.run_id, asyncio.get_running_loop()
 
     def _text_cb(delta: Optional[str]) -> None:
-        if delta is None or run_id not in self._run_streams:
+        if delta is None:
+            return
+        generation = run.callback_generation()
+        if generation is None:
             return
         with suppress(Exception):
-            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=delta))
+            loop.call_soon_threadsafe(
+                run.put_event, _run_event(run_id, "message.delta", delta=delta), generation)
 
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
-        """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
+        """Terminal status, then best-effort ``run.<status>`` event; key order is wire format."""
+        if not run.mark_terminal():
+            return
         extra = extra or {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
+            run.put_event(
+                _run_event(run_id, f"run.{status}", **fields, **extra),
+                run.event_generation,
+                allow_terminal=True,
+            )
 
     try:
         self._set_run_status(run_id, "running")
@@ -885,7 +986,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                stream_delta_callback=_text_cb,
+                tool_progress_callback=self._make_run_event_callback(run_id, loop, run=run),
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         raw_runtime_metadata = getattr(agent, "_hermes_api_runtime", None)
@@ -925,7 +1027,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.run_id, run.approval_session_key)
         with suppress(Exception):
-            run.put_event(None)  # sentinel: close the SSE stream
+            run.put_event(None, run.event_generation, allow_terminal=True)  # sentinel: close the SSE stream
+        run.retire()
         _retire_live_run(self, run_id)
 
 
