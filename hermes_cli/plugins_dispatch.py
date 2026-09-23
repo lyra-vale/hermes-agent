@@ -131,6 +131,7 @@ class _QueuedPluginEvent:
     subscriptions: tuple[_EventSubscription, ...]
     depth: int
     generation: int
+    context: contextvars.Context
 
 
 # Hook callback timeout (non-blocking abandon). Default cap per Python hook callback; overridden by
@@ -333,7 +334,23 @@ class PluginDispatchMixin:
             self._event_idle.notify_all()
 
     def _deliver_event(self, item: _QueuedPluginEvent) -> None:
-        """Deliver one queued event on the host-owned worker thread."""
+        """Deliver one queued event on the host-owned worker thread.
+
+        The worker is deliberately long-lived and otherwise starts with the
+        default ContextVar values. Re-enter the producer's copied context so a
+        protected run remains a protected/redacted run after retirement, and
+        nested emits inherit the same fail-closed boundary.
+        """
+        try:
+            item.context.run(self._deliver_event_in_context, item)
+        except BaseException as exc:
+            logger.warning(
+                "Event '%s' subscriber context could not be restored (%s); dropping delivery",
+                item.event, type(exc).__name__,
+            )
+
+    def _deliver_event_in_context(self, item: _QueuedPluginEvent) -> None:
+        """Deliver one event after its producer context has been entered."""
         from hermes_cli.plugins import resolve_plugin_command_result
         with self._event_lock:
             if item.generation != self._event_generation:
@@ -376,6 +393,21 @@ class PluginDispatchMixin:
                 "— dropping this emit to prevent an infinite loop", _EVENT_EMIT_DEPTH_CAP, event)
             return 0
         budget_msg = "Event bus pending budget (%d) exhausted while dispatching '%s' — dropping this emit"
+        try:
+            event_context = contextvars.copy_context()
+        except BaseException as exc:
+            # A missing producer context is not safe for a protected event:
+            # dropping is preferable to invoking a subscriber as ordinary code.
+            logger.warning(
+                "Event '%s' producer context could not be captured (%s); dropping emit",
+                event, type(exc).__name__,
+            )
+            return 0
+        if event_context is None:
+            logger.warning(
+                "Event '%s' producer context was unavailable; dropping emit", event
+            )
+            return 0
         with self._event_lock:
             subscriptions = tuple(self._subscriptions.get(event, []))
             if not subscriptions:
@@ -387,7 +419,7 @@ class PluginDispatchMixin:
                 return 0
             item = _QueuedPluginEvent(
                 event=event, payload=dict(payload), subscriptions=subscriptions, depth=depth + 1,
-                generation=generation)
+                generation=generation, context=event_context)
             try:
                 self._event_queue.put_nowait(item)
             except queue.Full:

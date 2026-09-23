@@ -226,10 +226,10 @@ async def test_protected_tool_progress_preview_failure_fails_closed(monkeypatch)
         _api_server=api_server_module,
     )
 
-    def broken_binding_lookup():
+    def broken_redaction_lookup():
         raise RuntimeError("protected context lookup failed")
 
-    monkeypatch.setattr(protected, "current_protected_api_run_binding", broken_binding_lookup)
+    monkeypatch.setattr(protected, "protected_api_run_redaction_active", broken_redaction_lookup)
     with protected.bind_protected_api_run(_policy(run_id)):
         callback("tool.started", "write_file", "/calendar/event.json content=secret")
     await asyncio.sleep(0)
@@ -260,6 +260,30 @@ async def test_protected_tool_progress_hides_preview_without_context():
         assert event["preview"] is None
     finally:
         store.retire_run(policy.run_id, policy.approval_session)
+
+
+@pytest.mark.asyncio
+async def test_post_retire_late_tool_event_stays_redacted_outside_run_context():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_id = "run_post_retire_late_tool_event"
+    adapter._run_streams[run_id] = asyncio.Queue()
+    adapter._run_statuses[run_id] = {"object": "hermes.run", "run_id": run_id, "status": "running"}
+    policy = _policy(run_id)
+    store = protected.ProtectedApiRunApprovalStore()
+    store.register_policy(policy)
+    protected.retire_protected_api_run(run_id, policy.approval_session)
+
+    callback = api_server_runs._make_run_event_callback(
+        adapter,
+        run_id,
+        asyncio.get_running_loop(),
+        _api_server=api_server_module,
+    )
+    callback("tool.started", "write_file", "/calendar/post-retire.json content=secret")
+    await asyncio.sleep(0)
+
+    event = adapter._run_streams[run_id].get_nowait()
+    assert event["preview"] is None
 
 
 @pytest.mark.asyncio
@@ -498,6 +522,37 @@ async def test_protected_api_route_rejects_fifo_resolve_all_and_cross_run():
         worker.join(timeout=2)
 
     assert result["approved"] is False
+
+
+@pytest.mark.asyncio
+async def test_retired_protected_api_route_never_falls_through_to_generic_approval(monkeypatch):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_id = "run_retired_protected_route"
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_request(run_id, {}))
+    adapter._run_statuses[run_id] = {
+        "object": "hermes.run", "run_id": run_id, "status": "waiting_for_approval"
+    }
+    adapter._run_approval_sessions[run_id] = run_id
+    generic_calls = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: generic_calls.append((args, kwargs)) or 1,
+    )
+
+    policy = _policy(run_id)
+    store = protected.ProtectedApiRunApprovalStore()
+    store.register_policy(policy)
+    protected.retire_protected_api_run(run_id, policy.approval_session)
+
+    response = await api_server_runs._handle_run_approval(
+        adapter,
+        _request(run_id, {"choice": "once"}),
+        _api_server=api_server_module,
+    )
+
+    assert response.status == 409
+    assert json.loads(response.text)["error"]["code"] == "approval_run_retired"
+    assert generic_calls == []
 
 
 @pytest.mark.asyncio

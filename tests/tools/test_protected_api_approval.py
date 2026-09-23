@@ -320,6 +320,39 @@ def test_retired_run_rejects_delayed_policy_attachment():
         protected.reset_current_api_run_context(tokens)
 
 
+def test_retired_run_redaction_tombstones_are_bounded_by_size(monkeypatch):
+    monkeypatch.setattr(protected, "MAX_RETIRED_RUN_TOMBSTONES", 1)
+    protected._RETIRED_RUN_TOMBSTONES.clear()
+
+    protected.retire_protected_api_run("tombstone-size-a")
+    protected.retire_protected_api_run("tombstone-size-b")
+
+    assert protected._run_is_retired("tombstone-size-a") is False
+    assert protected._run_is_retired("tombstone-size-b") is True
+
+
+def test_expired_retired_run_redaction_tombstones_are_pruned():
+    key = "tombstone-expired"
+    protected._RETIRED_RUN_TOMBSTONES[key] = protected._RetiredRunTombstone(
+        key, None, time.monotonic() - 1
+    )
+
+    assert protected.protected_api_run_redaction_active(key) is False
+    assert key not in protected._RETIRED_RUN_TOMBSTONES
+
+
+def test_policy_retirement_redacts_run_without_active_context():
+    run_id = "policy-retirement-redaction"
+    approval_session = "policy-retirement-session"
+    policy = _policy(run_id=run_id, approval_session=approval_session)
+    store = protected.ProtectedApiRunApprovalStore()
+    store.register_policy(policy)
+    store.retire_run(run_id, approval_session)
+
+    assert protected.protected_api_run_redaction_active(run_id, approval_session) is True
+    assert protected.protected_api_run_redaction_active(run_id) is True
+
+
 def test_failed_policy_attachment_clears_binding_and_authorization(monkeypatch):
     store = protected.ProtectedApiRunApprovalStore()
     policy = _policy(run_id="run_attach_failure", approval_session="approval_attach_failure")

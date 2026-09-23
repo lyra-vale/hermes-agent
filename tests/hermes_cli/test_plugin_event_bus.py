@@ -299,6 +299,75 @@ def test_async_subscriber_is_awaited():
     assert observed == [7]
 
 
+def test_retired_protected_event_keeps_observer_redacted_and_blocks_tool_dispatch():
+    import json
+    import time
+
+    from tools import protected_api_approval as protected
+    from tools.registry import registry
+
+    manager = _fresh_manager()
+    ctx = _make_ctx(manager, "calendar", key="calendar")
+    entered = threading.Event()
+    release = threading.Event()
+    observed = []
+    dispatches = []
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = protected.ProtectedApiRunApprovalPolicy(
+        allowed_tool_names=("write_file",),
+        run_id="event-retire-run",
+        approval_session="event-retire-approval",
+        user_session_id="event-retire-user",
+        hermes_session_id="event-retire-hermes",
+        conversation_id="event-retire-conversation",
+        expires_at=time.time() + 30,
+    )
+
+    def block_worker(**_payload):
+        entered.set()
+        release.wait(timeout=2)
+
+    def late_observer(**payload):
+        args = payload["args"]
+        observed.append(protected.safe_protected_observer_args("write_file", args))
+        observed.append(ctx.dispatch_tool("write_file", args))
+
+    ctx.subscribe("calendar:tool", block_worker)
+    ctx.subscribe("calendar:tool", late_observer)
+    original_dispatch = registry.dispatch
+    registry.dispatch = lambda name, args, **kwargs: (
+        dispatches.append((name, args)) or json.dumps({"ok": True})
+    )
+    try:
+        with protected.bind_protected_api_run(policy, store=store):
+            assert ctx.emit("tool", {"args": {"path": "/calendar/private.json", "content": "secret"}}) == 2
+            assert entered.wait(timeout=1)
+            store.retire_run(policy.run_id, policy.approval_session)
+            release.set()
+            _drain(manager)
+    finally:
+        registry.dispatch = original_dispatch
+
+    assert observed[0] == {}
+    assert json.loads(observed[1])["error"].startswith("BLOCKED:")
+    assert dispatches == []
+
+
+def test_event_is_dropped_when_worker_context_cannot_be_captured(monkeypatch):
+    from hermes_cli import plugins_dispatch
+
+    manager = _fresh_manager()
+    ctx_a = _make_ctx(manager, "plugin_a", key="a")
+    ctx_b = _make_ctx(manager, "plugin_b", key="b")
+    observed = []
+    ctx_a.subscribe("b:ping", lambda **payload: observed.append(payload))
+    monkeypatch.setattr(plugins_dispatch.contextvars, "copy_context", lambda: None)
+
+    assert ctx_b.emit("ping", {"value": 1}) == 0
+    _drain(manager)
+    assert observed == []
+
+
 def test_remove_plugin_subscriptions_cancels_owner_entries():
     manager = _fresh_manager()
     ctx_a = _make_ctx(manager, "plugin_a", key="a")

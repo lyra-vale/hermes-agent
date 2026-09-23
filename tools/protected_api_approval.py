@@ -34,11 +34,14 @@ MAX_CANONICAL_STRING_BYTES = 32 * 1024
 MAX_IDENTITY_LENGTH = 256
 MAX_REDACTED_DESCRIPTION_LENGTH = 256
 MAX_PENDING_APPROVAL_RECORDS = 1024
+MAX_RETIRED_RUN_TOMBSTONES = 4096
+RETIRED_RUN_TOMBSTONE_TTL_SECONDS = 300.0
 
 __all__ = [
     "CanonicalActionError", "ProtectedApprovalError", "ProtectedApiRunApprovalPolicy",
     "ProtectedApiRunApprovalStore", "ProtectedApiRunBinding", "MAX_CANONICAL_ACTION_BYTES", "MAX_CANONICAL_ACTION_DEPTH",
     "MAX_REDACTED_DESCRIPTION_LENGTH", "MAX_PENDING_APPROVAL_RECORDS",
+    "MAX_RETIRED_RUN_TOMBSTONES", "RETIRED_RUN_TOMBSTONE_TTL_SECONDS",
     "bind_protected_api_run", "attach_protected_api_run_policy",
     "require_protected_api_run_approval", "verify_protected_dispatch", "canonical_action_json",
     "canonical_action_digest", "canonical_args_json", "canonical_args_digest",
@@ -46,7 +49,8 @@ __all__ = [
     "submit_protected_api_approval", "is_protected_api_run", "retire_protected_api_run",
     "protected_api_run_status_payload",
     "protected_observer_args", "safe_protected_observer_args",
-    "protected_api_run_context_active", "protected_exception_diagnostic",
+    "protected_api_run_context_active", "protected_api_run_redaction_active",
+    "protected_exception_diagnostic",
 ]
 
 _REQUIRED_APPROVAL_FIELDS = frozenset({"request_id", "action_digest", "choice"})
@@ -212,18 +216,78 @@ _CURRENT_AUTHORIZATION: contextvars.ContextVar[Optional[_DispatchAuthorization]]
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: Dict[tuple[str, str], set[Any]] = {}
-_RETIRED_RUN_IDS: set[str] = set()
+_RETIRED_RUN_TOMBSTONES: Dict[str, "_RetiredRunTombstone"] = {}
+_RETIRED_POLICY_TOMBSTONES: Dict[tuple[str, Optional[str]], "_RetiredRunTombstone"] = {}
 
 
-def _mark_run_retired(run_id: str) -> None:
-    """Leave a process-local tombstone so late attachment cannot revive a run."""
+@dataclass(frozen=True)
+class _RetiredRunTombstone:
+    """Bounded process-local identity retained for late protected cleanup."""
+
+    run_id: str
+    approval_session: Optional[str]
+    expires_at: float
+
+
+def _prune_retired_tombstones_locked(now: Optional[float] = None) -> None:
+    """Drop expired/oldest retirement markers; caller holds ``_ACTIVE_STORE_LOCK``."""
+    current = time.monotonic() if now is None else now
+    for tombstones in (_RETIRED_RUN_TOMBSTONES, _RETIRED_POLICY_TOMBSTONES):
+        for key, tombstone in list(tombstones.items()):
+            if current >= tombstone.expires_at:
+                tombstones.pop(key, None)
+        while len(tombstones) > MAX_RETIRED_RUN_TOMBSTONES:
+            tombstones.pop(next(iter(tombstones)))
+
+
+def _mark_run_retired(run_id: str, approval_session: Optional[str] = None) -> None:
+    """Leave a bounded terminal tombstone so late attachment cannot revive a run."""
     with _ACTIVE_STORE_LOCK:
-        _RETIRED_RUN_IDS.add(run_id)
+        now = time.monotonic()
+        _prune_retired_tombstones_locked(now)
+        _RETIRED_RUN_TOMBSTONES.pop(run_id, None)
+        _RETIRED_RUN_TOMBSTONES[run_id] = _RetiredRunTombstone(
+            run_id, approval_session, now + RETIRED_RUN_TOMBSTONE_TTL_SECONDS
+        )
+        _prune_retired_tombstones_locked(now)
+
+
+def _mark_policy_retired(run_id: str, approval_session: Optional[str] = None) -> None:
+    """Retain redaction identity after one policy generation is retired.
+
+    Unlike a terminal run tombstone this marker does not prevent a deliberate
+    equal-policy re-registration; it only keeps copied/unwinding contexts
+    protected from falling back to ordinary observer output.
+    """
+    with _ACTIVE_STORE_LOCK:
+        now = time.monotonic()
+        _prune_retired_tombstones_locked(now)
+        key = (run_id, approval_session)
+        _RETIRED_POLICY_TOMBSTONES.pop(key, None)
+        _RETIRED_POLICY_TOMBSTONES[key] = _RetiredRunTombstone(
+            run_id, approval_session, now + RETIRED_RUN_TOMBSTONE_TTL_SECONDS
+        )
+        _prune_retired_tombstones_locked(now)
 
 
 def _run_is_retired(run_id: str) -> bool:
     with _ACTIVE_STORE_LOCK:
-        return run_id in _RETIRED_RUN_IDS
+        _prune_retired_tombstones_locked()
+        return run_id in _RETIRED_RUN_TOMBSTONES
+
+
+def _run_has_redaction_tombstone(run_id: str, approval_session: Optional[str]) -> bool:
+    with _ACTIVE_STORE_LOCK:
+        _prune_retired_tombstones_locked()
+        return (
+            run_id in _RETIRED_RUN_TOMBSTONES
+            or (run_id, approval_session) in _RETIRED_POLICY_TOMBSTONES
+            or (run_id, None) in _RETIRED_POLICY_TOMBSTONES
+            or (
+                approval_session is None
+                and any(key[0] == run_id for key in _RETIRED_POLICY_TOMBSTONES)
+            )
+        )
 
 
 def _clear_current_run_authorization(run_id: str, approval_session: Optional[str] = None) -> None:
@@ -737,6 +801,7 @@ class ProtectedApiRunApprovalStore:
 
     def retire_run(self, run_id: str, approval_session: Optional[str] = None) -> None:
         """Fail closed and forget policy bindings when an API run retires."""
+        _mark_policy_retired(run_id, approval_session)
         _clear_current_run_authorization(run_id, approval_session)
         with _ACTIVE_STORE_LOCK:
             with self._lock:
@@ -933,9 +998,21 @@ def current_protected_api_run_binding() -> Optional[ProtectedApiRunBinding]:
     return _resolve_current_protected_binding()
 
 
+def _current_protected_redaction_active() -> bool:
+    """Return whether this context must remain redacted after policy teardown."""
+    binding = _CURRENT_BINDING.get()
+    context = _CURRENT_API_RUN_CONTEXT.get()
+    if binding is not None or context is not None:
+        # A stale binding is still a protected cleanup context. Its store may
+        # have removed the policy already, but late callbacks must not become
+        # ordinary observers while they unwind.
+        return True
+    return False
+
+
 def protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dict[str, Any]:
     """Return no raw arguments for any action observed inside a protected run."""
-    if _resolve_current_protected_binding() is not None:
+    if _current_protected_redaction_active() or _resolve_current_protected_binding() is not None:
         return {}
     return dict(args)
 
@@ -953,6 +1030,36 @@ def safe_protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dic
 def protected_api_run_context_active() -> bool:
     """Return whether this execution has API-run authorization state attached."""
     return _CURRENT_API_RUN_CONTEXT.get() is not None or _CURRENT_BINDING.get() is not None
+
+
+def protected_api_run_redaction_active(
+    run_id: str, approval_session: Optional[str] = None
+) -> bool:
+    """Return whether events for *run_id* must use the protected redaction shape.
+
+    This intentionally includes the bounded retirement tombstone.  Event
+    callbacks can outlive both the policy ledger and the ContextVar context;
+    treating that known terminal run as an ordinary run would expose a late
+    tool preview.  It does not make the run active for approval or dispatch.
+    """
+    try:
+        context = _CURRENT_API_RUN_CONTEXT.get()
+        if context is not None and context.run_id == run_id and (
+            approval_session is None or context.approval_session == approval_session
+        ):
+            return True
+        binding = _CURRENT_BINDING.get()
+        if binding is not None and binding.policy.run_id == run_id and (
+            approval_session is None or binding.policy.approval_session == approval_session
+        ):
+            return True
+        if _active_stores_for(run_id, approval_session):
+            return True
+        return _run_has_redaction_tombstone(run_id, approval_session)
+    except BaseException:
+        # An event redaction probe must never turn an uncertain security state
+        # into a raw preview.
+        return True
 
 
 def protected_exception_diagnostic(tool_name: str, exc: BaseException) -> str:

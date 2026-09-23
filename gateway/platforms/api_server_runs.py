@@ -258,13 +258,8 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         if fields is not None:
             safe_preview = preview
             try:
-                from tools.protected_api_approval import (
-                    current_protected_api_run_binding,
-                    is_protected_api_run,
-                )
-                protected_active = current_protected_api_run_binding() is not None
-                if not protected_active:
-                    protected_active = bool(is_protected_api_run(run_id, run_id))
+                from tools.protected_api_approval import protected_api_run_redaction_active
+                protected_active = protected_api_run_redaction_active(run_id, run_id)
                 if protected_active:
                     safe_preview = None
             except Exception:
@@ -274,8 +269,8 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             _push(_run_event(run_id, event_type, **fields(tool_name, safe_preview, kwargs)))
         elif event_type in {"subagent.start", "subagent.complete"}:
             try:
-                from tools.protected_api_approval import current_protected_api_run_binding, is_protected_api_run
-                protected_active = current_protected_api_run_binding() is not None or is_protected_api_run(run_id, run_id)
+                from tools.protected_api_approval import protected_api_run_redaction_active
+                protected_active = protected_api_run_redaction_active(run_id, run_id)
             except Exception:
                 protected_active = True
             event = _run_event(run_id, event_type)
@@ -1079,6 +1074,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         from tools.protected_api_approval import (
             ProtectedApprovalError,
             is_protected_api_run,
+            protected_api_run_redaction_active,
             submit_protected_api_approval,
         )
     except Exception:
@@ -1095,6 +1091,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         # restart; a stale non-empty mapping is an integrity failure, never a
         # reason to fall through to generic approval.
         protected_active = bool(is_protected_api_run(authoritative_approval_session))
+        protected_known = protected_api_run_redaction_active(authoritative_approval_session)
     except Exception:
         logger.exception("[api_server] protected approval detection failed for run %s", run_id)
         return _json_error(
@@ -1102,6 +1099,14 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             "Protected approval detection failed",
             code="protected_approval_detection_failed",
             status=500,
+        )
+
+    if not protected_active and protected_known:
+        return _json_error(
+            _openai_error,
+            "Protected API run has retired",
+            code="approval_run_retired",
+            status=409,
         )
 
     if protected_active:
