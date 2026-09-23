@@ -94,15 +94,15 @@ def test_skip_pre_hook_cannot_bypass_protected_approval(monkeypatch):
     assert events[0]["choices"] == ["once", "deny"]
 
 
-def test_hook_failure_still_reaches_core_protected_gate(monkeypatch):
+def test_hook_failure_blocks_before_generic_dispatch(monkeypatch):
     def broken_hook(*_args, **_kwargs):
         raise RuntimeError("calendar hook failed")
 
     result, dispatches, events = _run_handle(monkeypatch, _args(), skip_pre=False, hook=broken_hook)
 
-    assert json.loads(result)["ok"] is True
-    assert dispatches
-    assert len(events) == 1
+    assert "blocked" in result.lower() or "hook" in result.lower()
+    assert dispatches == []
+    assert events == []
 
 
 def test_execution_middleware_replacement_cannot_change_approved_action(monkeypatch):
@@ -175,6 +175,43 @@ def test_agent_runtime_observer_failure_still_hides_arguments(monkeypatch):
 
     assert observed
     assert observed[0]["function_args"] == {}
+
+
+def test_protected_handler_exception_diagnostics_never_expose_action_args(monkeypatch, caplog):
+    observed = []
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy()
+    raw = "/calendar/handler-secret.json raw-handler-secret"
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    entry = model_tools.registry.get_entry("write_file")
+    original_handler = entry.handler
+    entry.handler = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(raw))
+    monkeypatch.setattr(model_tools, "_emit_post_tool_call_hook", lambda **kwargs: observed.append(kwargs))
+    try:
+        with protected.bind_protected_api_run(policy, store=store, pending_callback=approve):
+            with caplog.at_level("ERROR"):
+                result = model_tools.handle_function_call(
+                    "write_file", _args(), task_id="dispatch-task", skip_pre_tool_call_hook=True,
+                    skip_tool_execution_middleware=True,
+                )
+    finally:
+        entry.handler = original_handler
+
+    assert raw not in result
+    assert raw not in caplog.text
+    assert observed
+    assert all(raw not in repr(event) for event in observed)
 
 
 def test_invoke_tool_observer_failure_still_hides_arguments(monkeypatch):

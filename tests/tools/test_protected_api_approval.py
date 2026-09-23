@@ -264,6 +264,127 @@ def test_registered_policy_is_not_silently_bypassed_by_core_gate():
     assert events
 
 
+def test_equal_policy_re_registration_invalidates_old_dispatch_authorization():
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy(run_id="run_epoch", approval_session="approval_epoch")
+
+    def approve(event):
+        store.submit_approval(
+            run_id=policy.run_id,
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    tokens = protected.set_current_api_run_context(
+        run_id=policy.run_id,
+        approval_session=policy.approval_session,
+        pending_callback=approve,
+    )
+    try:
+        store.register_policy(policy, pending_callback=approve)
+        result = protected.require_protected_api_run_approval("write_file", _action())
+        assert result["approved"] is True
+        assert protected.has_current_protected_dispatch_authorization()
+
+        store.retire_run(policy.run_id, policy.approval_session)
+        store.register_policy(policy, pending_callback=approve)
+
+        assert protected.verify_protected_dispatch("write_file", _action()) is False
+        assert not protected.has_current_protected_dispatch_authorization()
+    finally:
+        store.retire_run(policy.run_id, policy.approval_session)
+        protected.reset_current_api_run_context(tokens)
+
+
+def test_final_authorization_state_is_cleared_on_policy_early_return_and_resolution_error(monkeypatch):
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy(run_id="run_context_cleanup", approval_session="approval_context_cleanup")
+
+    def approve(event):
+        store.submit_approval(
+            run_id=event["run_id"],
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    with _bound(policy, store=store, pending_callback=approve):
+        assert protected.require_protected_api_run_approval("write_file", _action())["approved"] is True
+        assert protected.has_current_protected_dispatch_authorization()
+
+        mismatched = _policy(run_id="different-run", approval_session="different-approval")
+        blocked = protected.require_protected_api_run_approval(
+            "write_file", _action(), policy=mismatched
+        )
+        assert blocked["approved"] is False
+        assert not protected.has_current_protected_dispatch_authorization()
+
+        monkeypatch.setattr(
+            protected,
+            "_resolve_current_protected_binding",
+            lambda: (_ for _ in ()).throw(RuntimeError("resolution failed")),
+        )
+        failed = protected.require_protected_api_run_approval("write_file", _action())
+        assert failed["approved"] is False
+        assert not protected.has_current_protected_dispatch_authorization()
+
+
+def test_consumed_records_are_removed_and_pending_capacity_is_bounded():
+    store = protected.ProtectedApiRunApprovalStore(max_records=1)
+    policy = _policy(run_id="run_record_bound", approval_session="approval_record_bound")
+    events = []
+    first_result = {}
+    second_result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        first = threading.Thread(
+            target=_thread_target(
+                lambda: first_result.update(
+                    protected.require_protected_api_run_approval(
+                        "write_file", _action("/calendar/first.json")
+                    )
+                )
+            )
+        )
+        first.start()
+        assert _wait_for(lambda: len(events) == 1)
+
+        second = threading.Thread(
+            target=_thread_target(
+                lambda: second_result.update(
+                    protected.require_protected_api_run_approval(
+                        "write_file", _action("/calendar/second.json")
+                    )
+                )
+            )
+        )
+        second.start()
+        assert _wait_for(lambda: bool(second_result))
+        assert second_result["approved"] is False
+        assert "capacity" in second_result["message"].lower()
+
+        store.submit_approval(
+            run_id=policy.run_id,
+            approval_session=policy.approval_session,
+            body={
+                "request_id": events[0]["request_id"],
+                "action_digest": events[0]["action_digest"],
+                "choice": "deny",
+            },
+        )
+        first.join(timeout=2)
+        assert not first.is_alive()
+        assert first_result["approved"] is False
+        assert store.pending_record_count == 0
+
+
 def test_pending_metadata_and_body_require_exact_request_digest_and_choice():
     store = protected.ProtectedApiRunApprovalStore()
     events = []
@@ -371,7 +492,7 @@ def test_replay_is_single_use_and_fifo_or_resolve_all_cannot_be_used():
                     "choice": "once",
                 },
             )
-        assert exc.value.code == "approval_replayed"
+        assert exc.value.code == "approval_not_pending"
 
 
 def test_expiry_blocks_approval_and_pending_waiter():
@@ -403,6 +524,7 @@ def test_expiry_blocks_approval_and_pending_waiter():
             )
         assert exc.value.code == "approval_expired"
         worker.join(timeout=2)
+        assert store.pending_record_count == 0
     assert result["approved"] is False
     assert "expired" in result["message"].lower()
 

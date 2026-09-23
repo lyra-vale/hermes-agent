@@ -2217,7 +2217,7 @@ def switch_model(
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
-    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
+    """Plugin pre-tool-call hook verdict; protected hook failures block fail-closed."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
         block_message, modified_args = _dispatch_pre_tool_call_hooks(
@@ -2229,6 +2229,16 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
         )
         return block_message, (modified_args if modified_args is not None else function_args)
     except Exception:
+        try:
+            from tools.protected_api_approval import (
+                clear_current_protected_dispatch_authorization,
+                protected_api_run_context_active,
+            )
+            if protected_api_run_context_active():
+                clear_current_protected_dispatch_authorization()
+                return "BLOCKED: protected API approval hook failed", function_args
+        except Exception:
+            return "BLOCKED: protected API approval hook verification failed", function_args
         return None, function_args
 
 
@@ -2257,13 +2267,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
+        logger.debug("tool_request middleware error (%s)", type(_mw_err).__name__)
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         block_message, function_args = _pre_tool_block_message(
             agent, function_name, function_args, effective_task_id, tool_call_id, _tool_middleware_trace
         )
     if block_message is not None:
+        try:
+            from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+            clear_current_protected_dispatch_authorization()
+        except Exception:
+            pass
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         emit_terminal_post_tool_call(
             agent, function_name=function_name, function_args=_protected_observer_args_or_empty(function_name, function_args), result=result,
@@ -2371,6 +2386,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         effective_args = next_args if isinstance(next_args, dict) else function_args
         scope_block = _session_tool_scope_block(agent, function_name)
         if scope_block is not None:
+            try:
+                from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+                clear_current_protected_dispatch_authorization()
+            except Exception:
+                pass
             result = json.dumps({"error": scope_block}, ensure_ascii=False)
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,

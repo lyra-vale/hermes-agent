@@ -617,6 +617,14 @@ _TOOL_ERROR_STRIP_RES = (
 )
 
 
+def _clear_protected_authorization_state() -> None:
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except Exception:
+        pass
+
+
 def _sanitize_tool_error(error_msg: str) -> str:
     """Strip structural framing tokens from a tool error before the model sees it."""
     if not error_msg:
@@ -774,7 +782,21 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            try:
+                from tools.protected_api_approval import (
+                    clear_current_protected_dispatch_authorization,
+                    protected_api_run_context_active,
+                )
+                if protected_api_run_context_active():
+                    clear_current_protected_dispatch_authorization()
+                    message = "BLOCKED: protected API approval hook failed"
+                    return function_args, (tool_error(message), "protected_api_approval", message)
+            except Exception:
+                # A protected-context lookup failure cannot make this boundary
+                # fail open. The core gate remains the last line of defense.
+                message = "BLOCKED: protected API approval hook verification failed"
+                return function_args, (tool_error(message), "protected_api_approval", message)
+            logger.debug("pre_tool_call hook error (%s)", type(_hook_err).__name__)
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -873,7 +895,7 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: Dict[st
                                        status=status, error_type=error_type, error_message=error_message)
             return next((r for r in hook_results if isinstance(r, str)), result)
     except Exception as _hook_err:
-        logger.debug("transform_tool_result hook error: %s", _hook_err)
+        logger.debug("transform_tool_result hook error (%s)", type(_hook_err).__name__)
     return result
 
 
@@ -926,15 +948,18 @@ def handle_function_call(
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:
+            _clear_protected_authorization_state()
             return _emit(result, duration_ms=_elapsed_ms(start))
         from tools.tool_gateway.names import CONNECTOR_BATCH_SENTINEL
         if underlying[0] == CONNECTOR_BATCH_SENTINEL:
+            _clear_protected_authorization_state()
             from model_tools_connectors import dispatch_connector_batch
             return _emit(dispatch_connector_batch(
                 underlying[1]["calls"], ids, user_task=user_task,
                 enabled_tools=enabled_tools, middleware_trace=trace,
                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
             ), duration_ms=_elapsed_ms(start))
+        _clear_protected_authorization_state()
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
@@ -945,8 +970,10 @@ def handle_function_call(
     from tools.tool_gateway.names import is_connector_name, parse_connector_name
     if function_name == "manage_connections" or is_connector_name(function_name):
         if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
+            _clear_protected_authorization_state()
             return _emit(tool_error("Connectors are not available in this session."))
         if is_connector_name(function_name) and parse_connector_name(function_name) is None:
+            _clear_protected_authorization_state()
             return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
 
     original_args = dict(function_args)
@@ -955,11 +982,17 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
+            _clear_protected_authorization_state()
             return tool_error(f"{function_name} must be handled by the agent loop")
 
         function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
         if blocked is not None:
             result, error_type, error_message = blocked
+            try:
+                from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+                clear_current_protected_dispatch_authorization()
+            except Exception:
+                pass
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
 
         # This core-side gate runs even when the caller says the pre-tool hook
@@ -1000,14 +1033,23 @@ def handle_function_call(
 
     except Exception as e:
         try:
-            from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+            from tools.protected_api_approval import (
+                clear_current_protected_dispatch_authorization,
+                protected_api_run_context_active,
+                protected_exception_diagnostic,
+            )
             clear_current_protected_dispatch_authorization()
+            protected_context = protected_api_run_context_active()
+            diagnostic = protected_exception_diagnostic(function_name, e)
         except Exception:
-            pass
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
-        return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
-                     status="error", error_type=type(e).__name__, error_message=str(e))
+            protected_context = True
+            diagnostic = f"Protected tool '{function_name}' execution failed ({type(e).__name__})"
+        if protected_context:
+            logger.error("Tool %s execution failed in protected API run (%s)", function_name, type(e).__name__)
+        else:
+            logger.exception("Error executing %s: %s", function_name, str(e))
+        return _emit(tool_error(_sanitize_tool_error(diagnostic)), duration_ms=_elapsed_ms(start),
+                     status="error", error_type=type(e).__name__, error_message=diagnostic)
 
 
 # =============================================================================

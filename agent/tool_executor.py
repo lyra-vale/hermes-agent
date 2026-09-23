@@ -81,6 +81,30 @@ def _protected_runtime_callback_args(function_name: str, args: dict) -> dict:
         return {}
 
 
+def _protected_tool_exception_diagnostic(function_name: str, exc: Exception) -> str:
+    try:
+        from tools.protected_api_approval import protected_exception_diagnostic
+        return protected_exception_diagnostic(function_name, exc)
+    except Exception:
+        return f"Error executing tool '{function_name}' failed ({type(exc).__name__})"
+
+
+def _log_tool_exception(function_name: str, exc: Exception) -> None:
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except Exception:
+        pass
+    try:
+        from tools.protected_api_approval import protected_api_run_context_active
+        if protected_api_run_context_active():
+            logger.error("tool %s raised (%s)", function_name, type(exc).__name__)
+            return
+    except Exception:
+        pass
+    logger.error("tool %s raised: %s", function_name, exc, exc_info=True)
+
+
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""
     try:
@@ -631,6 +655,11 @@ def _run_with_activity_heartbeat(agent, function_name: str, fn):
 def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[str], block_error_type: str, guardrail_decision) -> str:
     """Synthesize the result for a call blocked by scope/plugin (``block_message``) or by
     guardrail policy (``guardrail_decision``) and emit its terminal post_tool_call."""
+    try:
+        from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+        clear_current_protected_dispatch_authorization()
+    except Exception:
+        pass
     if block_message is not None:
         result, error_type, error_message = json.dumps({"error": block_message}, ensure_ascii=False), block_error_type, block_message
     else:
@@ -648,8 +677,7 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
 
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
-    """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
+    """Run ``pre_tool_call`` plugin hooks; protected hook failures block fail-closed."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
@@ -661,6 +689,16 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
     except Exception:
+        try:
+            from tools.protected_api_approval import (
+                clear_current_protected_dispatch_authorization,
+                protected_api_run_context_active,
+            )
+            if protected_api_run_context_active():
+                clear_current_protected_dispatch_authorization()
+                return "BLOCKED: protected API approval hook failed", ref.args
+        except Exception:
+            return "BLOCKED: protected API approval hook verification failed", ref.args
         return None, ref.args
 
 
@@ -694,6 +732,8 @@ def _dispatch_authorized_once(
         resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
+        if block_message is not None and block_message.startswith("BLOCKED: protected API approval"):
+            block_error_type = "protected_api_approval"
 
     guardrail_decision = None
     if block_message is None:
@@ -1304,8 +1344,8 @@ class _ConcurrentBatch:
             logger.info("tool %s cancelled (%.2fs)", ref.name, duration)
             return _ToolOutcome(ref, result, duration, True, False)
         except Exception as tool_error:
-            result = f"Error executing tool '{ref.name}': {tool_error}"
-            logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
+            result = _protected_tool_exception_diagnostic(ref.name, tool_error)
+            _log_tool_exception(ref.name, tool_error)
         duration = time.time() - start
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
@@ -1619,7 +1659,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         return _SequentialDispatch(
             execute=lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args, gate=False),
-            error_result=lambda e: json.dumps({"error": f"Context engine tool '{function_name}' failed: {e}"}),
+            error_result=lambda e: json.dumps({"error": _protected_tool_exception_diagnostic(function_name, e)}),
             error_log="context_engine.handle_tool_call raised for %s: %s",
         )
     if agent._memory_manager and agent._memory_manager.has_tool(function_name):
@@ -1627,7 +1667,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         return _SequentialDispatch(
             execute=lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
-            error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
+            error_result=lambda e: json.dumps({"error": _protected_tool_exception_diagnostic(function_name, e)}),
             error_log="memory_manager.handle_tool_call raised for %s: %s",
         )
 
@@ -1658,7 +1698,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         execute=_execute,
         spinner=_start_quiet_tool_spinner(agent, function_name, function_args) if agent.quiet_mode else None,
         middleware_trace_arg=middleware_trace,
-        error_result=lambda e: f"Error executing tool '{function_name}': {e}",
+        error_result=lambda e: _protected_tool_exception_diagnostic(function_name, e),
         error_log="handle_function_call raised for %s: %s",
         handles_keyboard_interrupt=True,
         finish_spinner=bool(agent.quiet_mode),
@@ -1717,9 +1757,17 @@ def _run_sequential_call(
         raise
     except Exception as tool_error:
         if dispatch.error_result is None:
-            raise
-        function_result = dispatch.error_result(tool_error)
-        logger.error(dispatch.error_log, ref.name, tool_error, exc_info=True)
+            try:
+                from tools.protected_api_approval import protected_api_run_context_active
+                protected_active = protected_api_run_context_active()
+            except Exception:
+                protected_active = False
+            if not protected_active:
+                raise
+            function_result = _protected_tool_exception_diagnostic(ref.name, tool_error)
+        else:
+            function_result = dispatch.error_result(tool_error)
+        _log_tool_exception(ref.name, tool_error)
         managed = _ManagedToolResult(result=function_result, args=ref.args, middleware_trace=ref.trace, blocked=False, dispatched=False)
     finally:
         if dispatch.is_delegate:

@@ -822,15 +822,27 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
-            # exc_info already renders the exception, so keep the message copy bounded.
-            logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
-            # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+            try:
+                from tools.protected_api_approval import (
+                    protected_api_run_context_active,
+                    protected_exception_diagnostic,
+                )
+                protected_context = protected_api_run_context_active()
+                diagnostic = protected_exception_diagnostic(name, e)
+            except Exception:
+                # If the security-context probe itself fails, do not log a
+                # traceback that could contain a protected action payload.
+                protected_context = True
+                diagnostic = f"Protected tool '{name}' execution failed ({type(e).__name__})"
+            if protected_context:
+                logger.error("Tool %s dispatch failed in protected API run (%s)", name, type(e).__name__)
+            else:
+                logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
             try:
                 from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
+                sanitized = _sanitize_tool_error(diagnostic)
             except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
+                sanitized = diagnostic
             return tool_error(sanitized)
 
     # ---- Query helpers -----------------------------------------------

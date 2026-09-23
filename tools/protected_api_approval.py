@@ -32,11 +32,12 @@ MAX_CANONICAL_ACTION_DEPTH = 32
 MAX_CANONICAL_STRING_BYTES = 32 * 1024
 MAX_IDENTITY_LENGTH = 256
 MAX_REDACTED_DESCRIPTION_LENGTH = 256
+MAX_PENDING_APPROVAL_RECORDS = 1024
 
 __all__ = [
     "CanonicalActionError", "ProtectedApprovalError", "ProtectedApiRunApprovalPolicy",
     "ProtectedApiRunApprovalStore", "ProtectedApiRunBinding", "MAX_CANONICAL_ACTION_BYTES", "MAX_CANONICAL_ACTION_DEPTH",
-    "MAX_REDACTED_DESCRIPTION_LENGTH",
+    "MAX_REDACTED_DESCRIPTION_LENGTH", "MAX_PENDING_APPROVAL_RECORDS",
     "bind_protected_api_run", "attach_protected_api_run_policy",
     "require_protected_api_run_approval", "verify_protected_dispatch", "canonical_action_json",
     "canonical_action_digest", "canonical_args_json", "canonical_args_digest",
@@ -44,6 +45,7 @@ __all__ = [
     "submit_protected_api_approval", "is_protected_api_run", "retire_protected_api_run",
     "protected_api_run_status_payload",
     "protected_observer_args", "safe_protected_observer_args",
+    "protected_api_run_context_active", "protected_exception_diagnostic",
 ]
 
 _REQUIRED_APPROVAL_FIELDS = frozenset({"request_id", "action_digest", "choice"})
@@ -158,6 +160,7 @@ class ProtectedApiRunBinding:
     policy: ProtectedApiRunApprovalPolicy
     store: "ProtectedApiRunApprovalStore"
     pending_callback: Optional[Callable[[Dict[str, Any]], None]]
+    policy_epoch: int
 
 
 @dataclass(frozen=True)
@@ -177,6 +180,7 @@ class _PendingApproval:
     action_digest: str
     expires_at: float
     policy: ProtectedApiRunApprovalPolicy
+    policy_epoch: int
     callback: Optional[Callable[[Dict[str, Any]], None]]
     event: threading.Event
     choice: Optional[str] = None
@@ -192,6 +196,7 @@ class _DispatchAuthorization:
     tool_name: str
     args_digest: str
     action_digest: str
+    policy_epoch: int
 
 
 _CURRENT_API_RUN_CONTEXT: contextvars.ContextVar[Optional[_ApiRunContext]] = contextvars.ContextVar(
@@ -371,16 +376,33 @@ def _safe_metadata(pending: _PendingApproval) -> Dict[str, Any]:
 class ProtectedApiRunApprovalStore:
     """Thread-safe in-memory ledger for protected API-run approvals."""
 
-    def __init__(self, *, clock: Optional[Callable[[], float]] = None):
+    def __init__(
+        self,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+        max_records: int = MAX_PENDING_APPROVAL_RECORDS,
+    ):
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records <= 0:
+            raise ValueError("max_records must be a positive integer")
         self._clock = clock or time.time
+        self._max_records = max_records
         self._lock = threading.RLock()
-        self._policies: Dict[tuple[str, str], tuple[ProtectedApiRunApprovalPolicy, Optional[Callable]]] = {}
+        self._policy_epoch = 0
+        self._policies: Dict[
+            tuple[str, str], tuple[ProtectedApiRunApprovalPolicy, Optional[Callable], int]
+        ] = {}
         self._records: Dict[tuple[str, str, str], _PendingApproval] = {}
         self._action_records: Dict[tuple[str, str, str, str], _PendingApproval] = {}
 
     @property
     def clock(self) -> Callable[[], float]:
         return self._clock
+
+    @property
+    def pending_record_count(self) -> int:
+        """Number of currently pending records held by this in-memory ledger."""
+        with self._lock:
+            return len(self._records)
 
     def register_policy(
         self,
@@ -403,10 +425,11 @@ class ProtectedApiRunApprovalStore:
                         code="approval_policy_conflict",
                     )
                 if pending_callback is not None and existing[1] is not pending_callback:
-                    self._policies[key] = (existing[0], pending_callback)
+                    self._policies[key] = (existing[0], pending_callback, existing[2])
                 _track_active_store(key, self)
                 return existing[0]
-            self._policies[key] = (policy, pending_callback)
+            self._policy_epoch += 1
+            self._policies[key] = (policy, pending_callback, self._policy_epoch)
             _track_active_store(key, self)
         return policy
 
@@ -421,7 +444,21 @@ class ProtectedApiRunApprovalStore:
             registered = self._policies.get((run_id, approval_session))
             if registered is None:
                 return None
-            return ProtectedApiRunBinding(registered[0], self, registered[1])
+            return ProtectedApiRunBinding(registered[0], self, registered[1], registered[2])
+
+    def is_binding_current(self, binding: ProtectedApiRunBinding) -> bool:
+        """Return whether a binding belongs to the active policy generation."""
+        run_id = binding.policy.run_id
+        approval_session = binding.policy.approval_session
+        if not run_id or not approval_session:
+            return False
+        with self._lock:
+            registered = self._policies.get((run_id, approval_session))
+            return bool(
+                registered is not None
+                and registered[0] == binding.policy
+                and registered[2] == binding.policy_epoch
+            )
 
     def status_payload(
         self, *, run_id: str, approval_session: str, request_id: str
@@ -433,15 +470,29 @@ class ProtectedApiRunApprovalStore:
                 return None
             return _safe_metadata(record)
 
+    def _remove_record_locked(self, record: _PendingApproval) -> None:
+        record_key = (record.run_id, record.approval_session, record.request_id)
+        if self._records.get(record_key) is record:
+            self._records.pop(record_key, None)
+        action_key = (record.run_id, record.approval_session, record.tool_name, record.args_digest)
+        if self._action_records.get(action_key) is record:
+            self._action_records.pop(action_key, None)
+
+    def _prune_records_locked(self, now: float) -> None:
+        for record in list(self._records.values()):
+            if record.consumed:
+                self._remove_record_locked(record)
+            elif now >= record.expires_at:
+                self._expire_locked(record)
+
     def _expire_locked(self, record: _PendingApproval, *, message: str = "Protected approval expired") -> None:
         if record.consumed:
+            self._remove_record_locked(record)
             return
         record.choice = "deny"
         record.consumed = True
         record.failure_message = message
-        self._action_records.pop(
-            (record.run_id, record.approval_session, record.tool_name, record.args_digest), None
-        )
+        self._remove_record_locked(record)
         record.event.set()
 
     def request(
@@ -453,6 +504,8 @@ class ProtectedApiRunApprovalStore:
         pending_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Wait for one exact API response and claim its one-use dispatch token."""
+        # A fresh request cannot inherit a previous action's final token.
+        _CURRENT_AUTHORIZATION.set(None)
         if not policy.run_id or not policy.approval_session:
             return {"approved": False, "message": "BLOCKED: protected policy is not bound to an API run"}
         try:
@@ -468,15 +521,28 @@ class ProtectedApiRunApprovalStore:
             return {"approved": False, "message": "BLOCKED: protected approval policy expired"}
         key = (policy.run_id, policy.approval_session)
         with self._lock:
+            now = float(self._clock())
+            self._prune_records_locked(now)
             registered = self._policies.get(key)
-            if registered is None or registered[0] != policy:
+            current_binding = _CURRENT_BINDING.get()
+            if (
+                registered is None
+                or registered[0] != policy
+                or current_binding is None
+                or current_binding.store is not self
+                or current_binding.policy != policy
+                or current_binding.policy_epoch != registered[2]
+            ):
                 return {"approved": False, "message": "BLOCKED: protected policy is not active for this run"}
             action_key = (policy.run_id, policy.approval_session, normalized_tool, args_digest)
             record = self._action_records.get(action_key)
             if record is not None:
                 if record.consumed:
+                    self._remove_record_locked(record)
                     return {"approved": False, "message": "BLOCKED: protected approval was already used"}
                 created = False
+            elif len(self._records) >= self._max_records:
+                return {"approved": False, "message": "BLOCKED: protected approval capacity is exhausted"}
             else:
                 record = _PendingApproval(
                     run_id=policy.run_id,
@@ -487,6 +553,7 @@ class ProtectedApiRunApprovalStore:
                     action_digest=action_digest,
                     expires_at=min(policy.expires_at, now + max(policy.expires_at - now, 0.0)),
                     policy=policy,
+                    policy_epoch=registered[2],
                     callback=pending_callback if pending_callback is not None else registered[1],
                     event=threading.Event(),
                 )
@@ -522,7 +589,16 @@ class ProtectedApiRunApprovalStore:
             # The API response is consumed before a waiter receives a dispatch token.
             record.claimed = True
             binding = _CURRENT_BINDING.get()
-            if binding is None or binding.policy != policy or binding.store is not self:
+            registered = self._policies.get(key)
+            if (
+                binding is None
+                or binding.policy != policy
+                or binding.store is not self
+                or registered is None
+                or binding.policy_epoch != registered[2]
+                or record.policy_epoch != binding.policy_epoch
+            ):
+                _CURRENT_AUTHORIZATION.set(None)
                 return {"approved": False, "message": "BLOCKED: protected approval context changed"}
             _CURRENT_AUTHORIZATION.set(
                 _DispatchAuthorization(
@@ -531,6 +607,7 @@ class ProtectedApiRunApprovalStore:
                     tool_name=record.tool_name,
                     args_digest=record.args_digest,
                     action_digest=record.action_digest,
+                    policy_epoch=record.policy_epoch,
                 )
             )
             return {
@@ -590,9 +667,7 @@ class ProtectedApiRunApprovalStore:
                 )
             record.choice = choice
             record.consumed = True
-            self._action_records.pop(
-                (record.run_id, record.approval_session, record.tool_name, record.args_digest), None
-            )
+            self._remove_record_locked(record)
             record.event.set()
             return {
                 "object": "hermes.protected_api_run_approval",
@@ -626,7 +701,7 @@ class ProtectedApiRunApprovalStore:
             for key in keys:
                 self._policies.pop(key, None)
                 _untrack_active_store(key, self)
-            for record in self._records.values():
+            for record in list(self._records.values()):
                 if record.run_id == run_id and (approval_session is None or record.approval_session == approval_session):
                     self._expire_locked(record, message="Protected API run retired")
 
@@ -671,7 +746,11 @@ def attach_protected_api_run_policy(
     pending_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> ProtectedApiRunBinding:
     """Attach a policy to the current API run; intended for a local adapter hook."""
+    # Attachment starts a fresh authorization boundary. Clearing first also
+    # prevents a failed policy bind from leaving an older token live.
+    _CURRENT_AUTHORIZATION.set(None)
     context = _CURRENT_API_RUN_CONTEXT.get()
+    context_created = False
     if context is None:
         if not policy.run_id or not policy.approval_session:
             raise ProtectedApprovalError(
@@ -679,18 +758,37 @@ def attach_protected_api_run_policy(
                 code="approval_context_missing",
             )
         context = _ApiRunContext(policy.run_id, policy.approval_session, pending_callback)
-        _CURRENT_API_RUN_CONTEXT.set(context)
+        context_created = True
     bound = policy.for_run(run_id=context.run_id, approval_session=context.approval_session)
     target_store = store or _DEFAULT_STORE
     callback = pending_callback if pending_callback is not None else context.pending_callback
     registered = target_store.register_policy(bound, pending_callback=callback)
-    binding = ProtectedApiRunBinding(registered, target_store, callback)
+    binding = target_store.binding_for(registered.run_id or "", registered.approval_session or "")
+    if binding is None:
+        _CURRENT_AUTHORIZATION.set(None)
+        raise ProtectedApprovalError(
+            "Protected policy could not be resolved after registration",
+            code="approval_policy_unavailable",
+            status=500,
+        )
     current = _CURRENT_BINDING.get()
+    if current is not None:
+        try:
+            current_active = current.store.is_binding_current(current)
+        except Exception:
+            current_active = False
+        if not current_active:
+            _CURRENT_AUTHORIZATION.set(None)
+            _CURRENT_BINDING.set(None)
+            current = None
     if current is not None and current != binding:
+        _CURRENT_AUTHORIZATION.set(None)
         raise ProtectedApprovalError(
             "A different protected policy is already active in this API-run context",
             code="approval_policy_conflict",
         )
+    if context_created:
+        _CURRENT_API_RUN_CONTEXT.set(context)
     _CURRENT_BINDING.set(binding)
     return binding
 
@@ -734,7 +832,15 @@ def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
     """Resolve a policy registered for the current API run before generic fallback."""
     binding = _CURRENT_BINDING.get()
     if binding is not None:
-        return binding
+        try:
+            if binding.store.is_binding_current(binding):
+                return binding
+        except Exception:
+            pass
+        # A retired or replaced generation must never carry its token into a
+        # later equal-policy registration in the same copied context.
+        _CURRENT_AUTHORIZATION.set(None)
+        _CURRENT_BINDING.set(None)
     context = _CURRENT_API_RUN_CONTEXT.get()
     if context is None:
         return None
@@ -752,7 +858,7 @@ def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
         return None
     if binding.pending_callback is None and context.pending_callback is not None:
         stores[0].register_policy(binding.policy, pending_callback=context.pending_callback)
-        binding = ProtectedApiRunBinding(binding.policy, stores[0], context.pending_callback)
+        binding = ProtectedApiRunBinding(binding.policy, stores[0], context.pending_callback, binding.policy_epoch)
     _CURRENT_BINDING.set(binding)
     return binding
 
@@ -785,6 +891,22 @@ def safe_protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dic
             return {}
 
 
+def protected_api_run_context_active() -> bool:
+    """Return whether this execution has API-run authorization state attached."""
+    return _CURRENT_API_RUN_CONTEXT.get() is not None or _CURRENT_BINDING.get() is not None
+
+
+def protected_exception_diagnostic(tool_name: str, exc: BaseException) -> str:
+    """Return a handler diagnostic that cannot interpolate protected action data."""
+    try:
+        active = protected_api_run_context_active()
+    except Exception:
+        active = True
+    if active:
+        return f"Protected tool '{tool_name}' execution failed ({type(exc).__name__})"
+    return f"Tool execution failed: {type(exc).__name__}: {exc}"
+
+
 def has_current_protected_dispatch_authorization() -> bool:
     """Return whether a protected approval token is awaiting final dispatch."""
     return _CURRENT_AUTHORIZATION.get() is not None
@@ -796,12 +918,8 @@ def clear_current_protected_dispatch_authorization() -> None:
 
 
 def _binding_is_active(binding: ProtectedApiRunBinding) -> bool:
-    run_id = binding.policy.run_id
-    approval_session = binding.policy.approval_session
-    if not run_id or not approval_session:
-        return False
     try:
-        return bool(binding.store.is_protected_run(run_id, approval_session))
+        return bool(binding.store.is_binding_current(binding))
     except Exception:
         return False
 
@@ -819,13 +937,20 @@ def require_protected_api_run_approval(
     calls it after request/pre-tool transformations and regardless of skip flags,
     so the adapter hook is not an authorization boundary.
     """
+    def blocked(message: str) -> Dict[str, Any]:
+        clear_current_protected_dispatch_authorization()
+        return {"approved": False, "message": message}
+
     try:
         binding = _resolve_current_protected_binding()
     except Exception:
-        return {"approved": False, "message": "BLOCKED: protected policy resolution failed"}
+        return blocked("BLOCKED: protected policy resolution failed")
     if policy is not None:
         if binding is None:
-            binding = attach_protected_api_run_policy(policy, store=store)
+            try:
+                binding = attach_protected_api_run_policy(policy, store=store)
+            except Exception:
+                return blocked("BLOCKED: protected policy attachment failed")
         else:
             try:
                 expected = policy.for_run(
@@ -835,59 +960,72 @@ def require_protected_api_run_approval(
             except Exception:
                 expected = None
             if expected != binding.policy:
-                return {"approved": False, "message": "BLOCKED: protected policy context changed"}
+                return blocked("BLOCKED: protected policy context changed")
     if binding is None:
+        # A stale token must not survive a legacy/no-policy early return.
+        clear_current_protected_dispatch_authorization()
         return {"approved": True, "protected": False}
     if not _binding_is_active(binding):
-        clear_current_protected_dispatch_authorization()
-        return {"approved": False, "message": "BLOCKED: protected policy is not active for this run"}
+        return blocked("BLOCKED: protected policy is not active for this run")
     if not binding.policy.allows_tool(tool_name):
-        clear_current_protected_dispatch_authorization()
-        return {"approved": False, "message": f"BLOCKED: tool '{tool_name}' is not in the protected allowlist"}
+        return blocked(f"BLOCKED: tool '{tool_name}' is not in the protected allowlist")
     authorization = _CURRENT_AUTHORIZATION.get()
-    if authorization is not None and authorization.binding == binding:
-        try:
-            digest = canonical_action_digest(tool_name, args)
-            args_digest = canonical_args_digest(args)
-        except CanonicalActionError:
+    if authorization is not None:
+        if authorization.binding != binding or authorization.policy_epoch != binding.policy_epoch:
             clear_current_protected_dispatch_authorization()
-            return {"approved": False, "message": "BLOCKED: protected action could not be canonicalized"}
-        if (
-            authorization.tool_name == tool_name
-            and hmac.compare_digest(authorization.action_digest, digest)
-            and hmac.compare_digest(authorization.args_digest, args_digest)
-        ):
-            return {"approved": True, "protected": True, "request_id": authorization.request_id, "action_digest": digest}
-        clear_current_protected_dispatch_authorization()
-        return {"approved": False, "message": "BLOCKED: protected action changed after approval"}
-    return binding.store.request(
-        binding.policy,
-        tool_name,
-        args,
-        pending_callback=binding.pending_callback,
-    )
+            authorization = None
+        else:
+            try:
+                digest = canonical_action_digest(tool_name, args)
+                args_digest = canonical_args_digest(args)
+            except CanonicalActionError:
+                return blocked("BLOCKED: protected action could not be canonicalized")
+            if (
+                authorization.tool_name == tool_name
+                and hmac.compare_digest(authorization.action_digest, digest)
+                and hmac.compare_digest(authorization.args_digest, args_digest)
+            ):
+                return {
+                    "approved": True,
+                    "protected": True,
+                    "request_id": authorization.request_id,
+                    "action_digest": digest,
+                }
+            return blocked("BLOCKED: protected action changed after approval")
+    try:
+        return binding.store.request(
+            binding.policy,
+            tool_name,
+            args,
+            pending_callback=binding.pending_callback,
+        )
+    except Exception:
+        return blocked("BLOCKED: protected approval request failed")
 
 
 def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consume: bool = True) -> bool:
     """Verify the exact action immediately before core/inline dispatch.
 
     No active protected policy means legacy callers retain their existing path.
-    An allowlisted call with no authorization, or any changed tool/arguments,
-    fails closed.  ``consume=False`` is the outer agent preflight; the registry
-    boundary uses the default one-use consume operation.
+    A retired binding, an allowlisted call with no authorization, or any changed
+    tool/arguments fails closed. ``consume=False`` is the outer agent preflight;
+    the registry boundary uses the default one-use consume operation.
     """
+    had_binding = _CURRENT_BINDING.get() is not None
     try:
         binding = _resolve_current_protected_binding()
     except Exception:
         clear_current_protected_dispatch_authorization()
         return False
     if binding is None:
-        return True
+        clear_current_protected_dispatch_authorization()
+        return not had_binding
     if not _binding_is_active(binding):
         clear_current_protected_dispatch_authorization()
         return False
     authorization = _CURRENT_AUTHORIZATION.get()
-    if authorization is None:
+    if authorization is None or authorization.policy_epoch != binding.policy_epoch:
+        clear_current_protected_dispatch_authorization()
         return False
     try:
         digest = canonical_action_digest(tool_name, args)

@@ -35,6 +35,29 @@ from hermes_cli.middleware import (
 )
 
 
+
+
+def test_pre_tool_callback_exception_fails_closed_without_exception_payload(caplog):
+    manager = PluginManager()
+
+    def broken_callback(**_kwargs):
+        raise RuntimeError("raw protected action arguments")
+
+    manager._hooks["pre_tool_call"] = [broken_callback]
+    with caplog.at_level(logging.WARNING):
+        results = manager.invoke_hook(
+            "pre_tool_call",
+            tool_name="write_file",
+            args={"path": "/calendar/private.json", "content": "secret"},
+        )
+
+    assert results == [{
+        "action": "block",
+        "message": "pre_tool_call plugin callback failed; protected execution blocked",
+    }]
+    assert "raw protected action arguments" not in caplog.text
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 

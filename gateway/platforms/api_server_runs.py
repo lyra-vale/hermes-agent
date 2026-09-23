@@ -789,7 +789,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 ),
                 reset_current_api_run_context,
             ))
-            register_gateway_notify(run.approval_session_key, approval_notify)
+            register_gateway_notify(run.run_id, approval_notify)
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
@@ -806,7 +806,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 self._bind_declared_conversation(
                     getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
             try:
-                unregister_gateway_notify(run.approval_session_key)
+                unregister_gateway_notify(run.run_id)
             finally:
                 for token, reset in resets:
                     with suppress(Exception):
@@ -928,25 +928,30 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
-        _unregister_approval_notify(run.approval_session_key)
+        _unregister_approval_notify(run.run_id, run.approval_session_key)
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
 
 
-def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
-    """Release generic and protected approval waiters for a retired API run."""
+def _unregister_approval_notify(run_id: Optional[str], approval_session_key: Optional[str] = None) -> None:
+    """Release approval waiters by authoritative run identity.
+
+    ``approval_session_key`` is retained only as an observed compatibility
+    value. It must never be the sole retirement key: the in-memory index can be
+    missing, stale, or corrupt while the run task is still blocked.
+    """
+    if not run_id:
+        return
     with suppress(Exception):
         from tools.approval import unregister_gateway_notify
-        if approval_session_key:
-            unregister_gateway_notify(approval_session_key)
+        unregister_gateway_notify(run_id)
     # Generic notify registration and protected policy registration are separate
     # ledgers; unregistering one must not leave the protected waiter parked
     # until its expiry.
     with suppress(Exception):
         from tools.protected_api_approval import retire_protected_api_run
-        if approval_session_key:
-            retire_protected_api_run(approval_session_key)
+        retire_protected_api_run(run_id)
 
 
 def _release_run_owner_if_forgotten(self, run_id: str) -> None:
@@ -1069,6 +1074,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         return _json_error(_openai_error, "Approval body must be a JSON object", code="invalid_approval_body", status=400)
 
     approval_session_key = self._run_approval_sessions.get(run_id)
+    authoritative_approval_session = run_id or ""
     try:
         from tools.protected_api_approval import (
             ProtectedApprovalError,
@@ -1084,9 +1090,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             status=500,
         )
     try:
-        # Query by run id even if the adapter's session table is incomplete;
-        # an active protected policy must never be reclassified as generic.
-        protected_active = bool(is_protected_api_run(run_id, approval_session_key))
+        # The admitted run id is the authoritative protected ledger key. The
+        # session table is only a compatibility index and may be absent after
+        # restart; a stale non-empty mapping is an integrity failure, never a
+        # reason to fall through to generic approval.
+        protected_active = bool(is_protected_api_run(authoritative_approval_session))
     except Exception:
         logger.exception("[api_server] protected approval detection failed for run %s", run_id)
         return _json_error(
@@ -1097,13 +1105,20 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         )
 
     if protected_active:
+        if approval_session_key is not None and approval_session_key != authoritative_approval_session:
+            return _json_error(
+                _openai_error,
+                "Protected approval session mapping is stale",
+                code="approval_session_mismatch",
+                status=409,
+            )
         # Protected runs never enter the generic choice/queue resolver.  In
         # particular, aliases, FIFO, resolve_all, session/always caches, and
         # approvals-off settings cannot authorize a Calendar write.
         try:
             response = submit_protected_api_approval(
                 run_id=run_id,
-                approval_session=approval_session_key,
+                approval_session=authoritative_approval_session,
                 body=body,
             )
         except Exception as exc:
@@ -1210,7 +1225,7 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
-    _unregister_approval_notify(self._run_approval_sessions.get(run_id))
+    _unregister_approval_notify(run_id, self._run_approval_sessions.get(run_id))
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
@@ -1239,7 +1254,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         # Transport TTL bounds buffering; live control state survives until the task returns.
         _drop_run_transport(self, run_id)
         if task is None or task.done():
-            _unregister_approval_notify(self._run_approval_sessions.get(run_id))
+            _unregister_approval_notify(run_id, self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}

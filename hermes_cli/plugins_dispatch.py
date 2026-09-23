@@ -200,8 +200,18 @@ class PluginDispatchMixin:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
+                    logger.warning(
+                        "Hook '%s' callback %s raised %s; blocking the tool",
+                        hook_name, getattr(cb, "__name__", repr(cb)), type(exc).__name__,
+                    )
+                    results.append({
+                        "action": "block",
+                        "message": "pre_tool_call plugin callback failed; protected execution blocked",
+                    })
+                else:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
         return results
 
     def _run_hook_callback_bounded(

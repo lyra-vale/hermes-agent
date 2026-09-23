@@ -85,6 +85,65 @@ async def test_protected_run_detection_failure_does_not_fall_through_to_generic_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mapping", [None, "stale-approval-session"])
+async def test_protected_approval_uses_authoritative_run_id_and_rejects_stale_mapping(monkeypatch, mapping):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_id = f"run_authoritative_lookup_{mapping or 'missing'}"
+    request = _request(run_id, {})
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
+    adapter._run_statuses[run_id] = {
+        "object": "hermes.run", "run_id": run_id, "status": "waiting_for_approval"
+    }
+    if mapping is not None:
+        adapter._run_approval_sessions[run_id] = mapping
+    generic_calls = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: generic_calls.append((args, kwargs)) or 1,
+    )
+
+    policy = _policy(run_id)
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    result = {}
+    with protected.bind_protected_api_run(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_copy_context_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval(
+                        "write_file", {"path": "/calendar/authoritative.json", "content": "secret"}
+                    )
+                )
+            )
+        )
+        worker.start()
+        assert await _wait_for(lambda: bool(events))
+        response = await api_server_runs._handle_run_approval(
+            adapter,
+            _request(
+                run_id,
+                {
+                    "request_id": events[0]["request_id"],
+                    "action_digest": events[0]["action_digest"],
+                    "choice": "once",
+                },
+            ),
+            _api_server=api_server_module,
+        )
+        if mapping is None:
+            assert response.status == 200
+            worker.join(timeout=2)
+            assert result["approved"] is True
+        else:
+            assert response.status == 409
+            assert json.loads(response.text)["error"]["code"] == "approval_session_mismatch"
+            assert worker.is_alive()
+            store.retire_run(run_id)
+            worker.join(timeout=2)
+        assert generic_calls == []
+
+
+@pytest.mark.asyncio
 async def test_unregister_retires_protected_waiter_without_waiting_for_expiry():
     store = protected._DEFAULT_STORE
     policy = _policy("run_unregister_retires_waiter")
@@ -124,7 +183,7 @@ async def test_stop_retires_protected_waiter_before_executor_finishes(monkeypatc
     adapter._run_statuses[run_id] = {
         "object": "hermes.run", "run_id": run_id, "status": "running"
     }
-    adapter._run_approval_sessions[run_id] = run_id
+    adapter._run_approval_sessions[run_id] = "corrupt-session-mapping"
     adapter._active_run_agents[run_id] = object()
     adapter._active_run_tasks[run_id] = object()
     monkeypatch.setattr(api_server_module, "request_hard_interrupt", lambda *_args, **_kwargs: None)
@@ -458,6 +517,76 @@ async def test_protected_tool_progress_preview_is_not_published():
     await asyncio.sleep(0)
     event = adapter._run_streams[run_id].get_nowait()
     assert event["preview"] is None
+
+
+@pytest.mark.asyncio
+async def test_real_api_run_lifecycle_admission_executor_status_and_stop(monkeypatch):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    run_started = threading.Event()
+
+    class ApprovalAgent:
+        session_id = "lifecycle-session"
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        _hermes_api_runtime = None
+
+        def run_conversation(self, **_kwargs):
+            policy = protected.ProtectedApiRunApprovalPolicy(
+                allowed_tool_names=("write_file",),
+                user_session_id="lifecycle-user",
+                hermes_session_id="lifecycle-hermes",
+                conversation_id="lifecycle-conversation",
+                expires_at=time.time() + 30,
+            )
+            protected.attach_protected_api_run_policy(policy)
+            run_started.set()
+            decision = protected.require_protected_api_run_approval(
+                "write_file", {"path": "/calendar/lifecycle.json", "content": "secret"}
+            )
+            return {"interrupted": not decision.get("approved"), "final_response": "done"}
+
+    monkeypatch.setattr(api_server_module, "request_hard_interrupt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api_server_module, "_reap_disconnected_agent_processes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: ApprovalAgent())
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"platform_toolsets": {"api_server": ["file"]}},
+    )
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async with TestClient(TestServer(app)) as client:
+        admitted = await client.post("/v1/runs", json={"input": "create a calendar event"})
+        assert admitted.status == 202
+        run_id = (await admitted.json())["run_id"]
+        assert run_started.wait(timeout=2)
+
+        for _ in range(50):
+            status_response = await client.get(f"/v1/runs/{run_id}")
+            status_payload = await status_response.json()
+            if status_payload.get("status") == "waiting_for_approval":
+                break
+            await asyncio.sleep(0.01)
+        assert status_payload["status"] == "waiting_for_approval"
+        assert status_payload["approval"]["approval_type"] == "protected_api_run"
+
+        stopped = await client.post(f"/v1/runs/{run_id}/stop", json={})
+        assert stopped.status == 200
+
+        for _ in range(100):
+            status_response = await client.get(f"/v1/runs/{run_id}")
+            status_payload = await status_response.json()
+            if status_payload.get("status") == "cancelled":
+                break
+            await asyncio.sleep(0.01)
+        assert status_payload["status"] == "cancelled"
+        assert run_id not in adapter._active_run_agents
 
 
 async def _wait_for(predicate, timeout=2.0):
