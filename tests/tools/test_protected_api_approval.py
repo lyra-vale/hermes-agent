@@ -98,6 +98,172 @@ def test_policy_allowlist_requires_an_exact_registered_name():
     assert events == []
 
 
+def test_pending_status_payload_has_complete_safe_contract():
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(redacted_description="Create the calendar event")
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        event = events[0]
+        assert event["request_id"]
+        assert event["tool_name"] == "write_file"
+        assert len(event["action_digest"]) == 64
+        assert event["action_digest"] == event["action_digest"].lower()
+        assert all(char in "0123456789abcdef" for char in event["action_digest"])
+        assert event["expires_at"] == policy.expires_at
+        assert event["choices"] == ["once", "deny"]
+        assert event["redacted_description"] == "Create the calendar event"
+        assert len(event["redacted_description"]) <= protected.MAX_REDACTED_DESCRIPTION_LENGTH
+        assert "/calendar/event.json" not in repr(event)
+        assert "approved" not in repr(event)
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+    assert result["approved"] is False
+
+
+def test_status_payload_is_rebuilt_from_server_policy():
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(
+        run_id="run_status_policy",
+        approval_session="approval_status_policy",
+        redacted_description="Server-held calendar action",
+    )
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        payload = protected.protected_api_run_status_payload(
+            policy.run_id, policy.approval_session, events[0]["request_id"]
+        )
+        assert payload["request_id"] == events[0]["request_id"]
+        assert payload["tool_name"] == "write_file"
+        assert payload["action_digest"] == events[0]["action_digest"]
+        assert payload["expires_at"] == policy.expires_at
+        assert payload["choices"] == ["once", "deny"]
+        assert payload["redacted_description"] == "Server-held calendar action"
+        assert "/calendar/event.json" not in repr(payload)
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+    assert result["approved"] is False
+
+
+def test_retired_status_payload_is_not_available():
+    store = protected._DEFAULT_STORE
+    events = []
+    policy = _policy(run_id="run_retired_status", approval_session="approval_retired_status")
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+        with pytest.raises(protected.ProtectedApprovalError) as exc:
+            protected.protected_api_run_status_payload(
+                policy.run_id, policy.approval_session, events[0]["request_id"]
+            )
+        assert exc.value.code == "approval_not_pending"
+
+    assert result["approved"] is False
+
+
+def test_attached_non_default_store_remains_visible_to_api_resolution():
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(run_id="run_custom_store", approval_session="approval_custom_store")
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        assert protected.is_protected_api_run(policy.run_id, policy.approval_session)
+
+        response = protected.submit_protected_api_approval(
+            run_id=policy.run_id,
+            approval_session=policy.approval_session,
+            body={
+                "request_id": events[0]["request_id"],
+                "action_digest": events[0]["action_digest"],
+                "choice": "once",
+            },
+        )
+        assert response["choice"] == "once"
+        worker.join(timeout=2)
+
+    assert result["approved"] is True
+
+
+def test_registered_policy_is_not_silently_bypassed_by_core_gate():
+    store = protected.ProtectedApiRunApprovalStore()
+    policy = _policy(run_id="run_registered_policy", approval_session="approval_registered_policy")
+    events = []
+
+    def approve(event):
+        events.append(event)
+        store.submit_approval(
+            run_id=policy.run_id,
+            approval_session=policy.approval_session,
+            body={
+                "request_id": event["request_id"],
+                "action_digest": event["action_digest"],
+                "choice": "once",
+            },
+        )
+
+    tokens = protected.set_current_api_run_context(
+        run_id=policy.run_id,
+        approval_session=policy.approval_session,
+        pending_callback=approve,
+    )
+    try:
+        store.register_policy(policy)
+        result = protected.require_protected_api_run_approval("write_file", _action())
+        verified = protected.verify_protected_dispatch("write_file", _action())
+    finally:
+        store.retire_run(policy.run_id, policy.approval_session)
+        protected.reset_current_api_run_context(tokens)
+
+    assert result["approved"] is True
+    assert verified is True
+    assert events
+
+
 def test_pending_metadata_and_body_require_exact_request_digest_and_choice():
     store = protected.ProtectedApiRunApprovalStore()
     events = []

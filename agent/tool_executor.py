@@ -67,6 +67,20 @@ def _tc_name(tool_call: Any) -> str:
     return getattr(getattr(tool_call, "function", None), "name", "") or "tool"
 
 
+def _protected_runtime_callback_args(function_name: str, args: dict) -> dict:
+    """Keep agent UI/diagnostic callbacks fail-closed for protected actions."""
+    try:
+        from tools.protected_api_approval import (
+            current_protected_api_run_binding,
+            safe_protected_observer_args,
+        )
+        if current_protected_api_run_binding() is None:
+            return args
+        return safe_protected_observer_args(function_name, args)
+    except Exception:
+        return {}
+
+
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""
     try:
@@ -270,12 +284,13 @@ class _ToolCallRef:
         """Emit the one terminal ``post_tool_call`` for this call (``outcome`` = status /
         error_type / error_message / duration_ms). Resolved through the module attribute so
         tests patching ``_emit_terminal_post_tool_call`` still intercept."""
-        observer_args = self.args
+        observer_args: dict[str, Any] = {}
         try:
-            from tools.protected_api_approval import protected_observer_args
-            observer_args = protected_observer_args(self.name, observer_args)
+            from tools.protected_api_approval import safe_protected_observer_args
+            observer_args = safe_protected_observer_args(self.name, self.args)
         except Exception:
-            pass
+            # Never let a diagnostic sanitizer failure echo a protected action.
+            observer_args = {}
         _emit_terminal_post_tool_call(
             agent,
             function_name=self.name,
@@ -743,24 +758,19 @@ def _dispatch_authorized_once(
                 guardrail_decision=None,
             )
     except Exception:
-        # A protected token is only present when the protected module has
-        # established a policy; fail closed rather than dispatching a token
-        # whose final verifier is unavailable.
-        try:
-            from tools.protected_api_approval import has_current_protected_dispatch_authorization
-            if has_current_protected_dispatch_authorization():
-                _advance_start_order()
-                state.blocked = True
-                message = "BLOCKED: protected API approval verification failed"
-                return _blocked_tool_result(
-                    agent,
-                    ref,
-                    block_message=message,
-                    block_error_type="protected_api_approval",
-                    guardrail_decision=None,
-                )
-        except Exception:
-            pass
+        # A protected final-dispatch check is a security boundary.  If the
+        # verifier or the authorization-state lookup fails, there is no safe
+        # way to prove that this call is legacy/unprotected; block it.
+        _advance_start_order()
+        state.blocked = True
+        message = "BLOCKED: protected API approval verification failed"
+        return _blocked_tool_result(
+            agent,
+            ref,
+            block_message=message,
+            block_error_type="protected_api_approval",
+            guardrail_decision=None,
+        )
 
     if ref.name == "memory":
         agent._turns_since_memory = 0
@@ -997,13 +1007,14 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
     """Run user-visible and checkpoint preflight on final tool arguments."""
     function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+    callback_args = _protected_runtime_callback_args(function_name, display_args)
     if _tool_progress_enabled(agent):
         prefix = f"Tool {display_index}" if display_index is not None else "Tool"
         if agent.verbose_logging:
-            print(f"  📞 {prefix}: {function_name}({list(display_args.keys())})")
-            print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
+            print(f"  📞 {prefix}: {function_name}({list(callback_args.keys())})")
+            print(agent._wrap_verbose("Args: ", json.dumps(callback_args, indent=2, ensure_ascii=False)))
         else:
-            print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
+            print(f"  📞 {prefix}: {function_name}({list(callback_args.keys())}) - {_preview(json.dumps(callback_args, ensure_ascii=False), agent.log_prefix_chars)}")
 
     agent._current_tool = function_name
     agent._touch_activity(f"executing tool: {function_name}")
@@ -1011,12 +1022,12 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
 
     if agent.tool_progress_callback:
         try:
-            preview = _build_tool_preview(function_name, display_args)
+            preview = _build_tool_preview(function_name, callback_args)
         except Exception as callback_error:
             logging.debug("Tool progress callback error: %s", callback_error)
         else:
-            _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args)
-    _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, display_args)
+            _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, callback_args)
+    _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, callback_args)
 
     if not agent._checkpoint_mgr.enabled:
         return
@@ -1039,7 +1050,8 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
         except Exception as cb_err:
             logging.debug("Tool complete callback error: %s", cb_err)
         else:
-            _safe_callback(agent.tool_complete_callback, "Tool complete", ref.call_id, ref.name, display_args, result)
+            callback_args = _protected_runtime_callback_args(ref.name, display_args)
+            _safe_callback(agent.tool_complete_callback, "Tool complete", ref.call_id, ref.name, callback_args, result)
     if risk_metadata is not None and risk_metadata.get("risk") != "low":
         _safe_callback(
             agent.tool_progress_callback, "Tool output risk",
@@ -1479,7 +1491,8 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
         _persisted, display_function_result, risk_metadata = committed
 
         if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(ref.name, ref.args, tool_duration, result=display_function_result)
+            callback_args = _protected_runtime_callback_args(ref.name, ref.args)
+            cute_msg = _get_cute_tool_message_impl(ref.name, callback_args, tool_duration, result=display_function_result)
             agent._safe_print(f"  {cute_msg}")
         elif _tool_progress_enabled(agent):
             _print_tool_completed(agent, i + 1, tool_duration, _multimodal_text_summary(display_function_result))
@@ -1544,6 +1557,7 @@ def _start_quiet_tool_spinner(agent, function_name: str, function_args: dict, *,
     face = random.choice(KawaiiSpinner.get_waiting_faces())
     if label is None:
         display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+        display_args = _protected_runtime_callback_args(function_name, display_args)
         label = f"{_get_tool_emoji(function_name)} {_build_tool_label(function_name, display_args) or function_name}"
     spinner = KawaiiSpinner(f"{face} {label}", spinner_type='dots', print_fn=agent._print_fn)
     spinner.start()
@@ -1553,11 +1567,13 @@ def _start_quiet_tool_spinner(agent, function_name: str, function_args: dict, *,
 def _finish_quiet_tool_spinner(agent, spinner, function_name: str, function_args: dict, tool_duration: float, result) -> None:
     """Stop the spinner with the cute completion line, or print it when no spinner ran."""
     if spinner or agent._should_emit_quiet_tool_messages():
-        cute = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=result)
+        callback_args = _protected_runtime_callback_args(function_name, function_args)
+        cute = _get_cute_tool_message_impl(function_name, callback_args, tool_duration, result=result)
         spinner.stop(cute) if spinner else agent._vprint(f"  {cute}")
 
 
 def _delegate_spinner_label(function_args: dict) -> str:
+    function_args = _protected_runtime_callback_args("delegate_task", function_args)
     action = str(function_args.get("action") or "").strip().lower()
     tasks = function_args.get("tasks")
     if action in ("list", "steer", "stop"):

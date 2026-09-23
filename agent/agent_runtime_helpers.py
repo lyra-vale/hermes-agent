@@ -76,6 +76,15 @@ def _ra():
     return run_agent
 
 
+def _protected_observer_args_or_empty(function_name: str, args: dict) -> dict:
+    """Keep agent diagnostics safe when protected observer sanitization fails."""
+    try:
+        from tools.protected_api_approval import safe_protected_observer_args
+        return safe_protected_observer_args(function_name, args)
+    except Exception:
+        return {}
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
     "todo_list", "session_search", "memory", "clarify", "read_terminal", "desktop_preview",
     "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "gui_tour", "delegate_task",
@@ -2257,7 +2266,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         emit_terminal_post_tool_call(
-            agent, function_name=function_name, function_args=function_args, result=result,
+            agent, function_name=function_name, function_args=_protected_observer_args_or_empty(function_name, function_args), result=result,
             effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
             error_type="plugin_block", error_message=block_message,
             middleware_trace=_tool_middleware_trace,
@@ -2330,12 +2339,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
             )
             result = inline_executor(agent, next_args, inline_ctx)
-            observer_args = next_args if isinstance(next_args, dict) else function_args
-            try:
-                from tools.protected_api_approval import protected_observer_args
-                observer_args = protected_observer_args(function_name, observer_args)
-            except Exception:
-                pass
+            observer_args = _protected_observer_args_or_empty(
+                function_name, next_args if isinstance(next_args, dict) else function_args
+            )
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,
                 function_args=observer_args,
@@ -2367,7 +2373,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         if scope_block is not None:
             result = json.dumps({"error": scope_block}, ensure_ascii=False)
             emit_terminal_post_tool_call(
-                agent, function_name=function_name, function_args=effective_args, result=result,
+                agent, function_name=function_name,
+                function_args=_protected_observer_args_or_empty(function_name, effective_args), result=result,
                 effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
                 error_type="tool_scope_block", error_message=scope_block,
                 middleware_trace=_tool_middleware_trace,

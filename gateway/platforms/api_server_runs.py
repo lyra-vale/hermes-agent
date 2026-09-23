@@ -257,19 +257,35 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
             safe_preview = preview
-            with suppress(Exception):
-                from tools.protected_api_approval import current_protected_api_run_binding
-                binding = current_protected_api_run_binding()
-                if binding is not None and binding.policy.allows_tool(tool_name or ""):
+            try:
+                from tools.protected_api_approval import (
+                    current_protected_api_run_binding,
+                    is_protected_api_run,
+                )
+                protected_active = current_protected_api_run_binding() is not None
+                if not protected_active:
+                    protected_active = bool(is_protected_api_run(run_id, run_id))
+                if protected_active:
                     safe_preview = None
+            except Exception:
+                # A protected-context lookup failure must not expose the
+                # preview through a runtime diagnostic event.
+                safe_preview = None
             _push(_run_event(run_id, event_type, **fields(tool_name, safe_preview, kwargs)))
         elif event_type in {"subagent.start", "subagent.complete"}:
+            try:
+                from tools.protected_api_approval import current_protected_api_run_binding, is_protected_api_run
+                protected_active = current_protected_api_run_binding() is not None or is_protected_api_run(run_id, run_id)
+            except Exception:
+                protected_active = True
             event = _run_event(run_id, event_type)
-            if preview is not None:
+            if preview is not None and not protected_active:
                 event["preview"] = redact_sensitive_text(str(preview), force=True)
             for key in _SUBAGENT_EVENT_KEYS:
                 value = kwargs.get(key)
                 if value is not None:
+                    if protected_active and key in _SUBAGENT_TEXT_KEYS:
+                        continue
                     # Free text may carry child tool output: force secret redaction on this public stream.
                     redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
                     event[key] = redact_sensitive_text(value, force=True) if redact else value
@@ -805,13 +821,23 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
         event = dict(approval_data or {})
         if event.get("approval_type") == "protected_api_run":
-            # The protected ledger already supplies a bounded, digest-only
-            # envelope. Rebuild it from the allowlist rather than passing
-            # through plugin-added args, commands, credentials, or paths.
+            # The protected ledger owns every status field. Resolve the pending
+            # record by its opaque request id; never trust callback-added fields.
+            try:
+                from tools.protected_api_approval import protected_api_run_status_payload
+                event = protected_api_run_status_payload(
+                    run_id=run_id,
+                    approval_session=run.approval_session_key,
+                    request_id=event["request_id"],
+                )
+            except Exception:
+                logger.exception("[api_server] protected approval status unavailable for run %s", run_id)
+                raise
             event = {
                 key: event[key]
                 for key in (
-                    "approval_type", "request_id", "tool_name", "args_digest", "action_digest", "expires_at",
+                    "approval_type", "run_id", "request_id", "tool_name", "args_digest", "action_digest",
+                    "expires_at", "redacted_description",
                 )
                 if key in event
             }
@@ -909,11 +935,18 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
-    """Best-effort release of a run's approval waiter (no-op without a key)."""
+    """Release generic and protected approval waiters for a retired API run."""
     with suppress(Exception):
         from tools.approval import unregister_gateway_notify
         if approval_session_key:
             unregister_gateway_notify(approval_session_key)
+    # Generic notify registration and protected policy registration are separate
+    # ledgers; unregistering one must not leave the protected waiter parked
+    # until its expiry.
+    with suppress(Exception):
+        from tools.protected_api_approval import retire_protected_api_run
+        if approval_session_key:
+            retire_protected_api_run(approval_session_key)
 
 
 def _release_run_owner_if_forgotten(self, run_id: str) -> None:
@@ -1042,12 +1075,26 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             is_protected_api_run,
             submit_protected_api_approval,
         )
-        protected_active = bool(
-            approval_session_key and is_protected_api_run(run_id, approval_session_key)
-        )
     except Exception:
-        ProtectedApprovalError = None  # type: ignore[assignment]
-        protected_active = False
+        logger.exception("[api_server] protected approval detection unavailable for run %s", run_id)
+        return _json_error(
+            _openai_error,
+            "Protected approval detection failed",
+            code="protected_approval_detection_failed",
+            status=500,
+        )
+    try:
+        # Query by run id even if the adapter's session table is incomplete;
+        # an active protected policy must never be reclassified as generic.
+        protected_active = bool(is_protected_api_run(run_id, approval_session_key))
+    except Exception:
+        logger.exception("[api_server] protected approval detection failed for run %s", run_id)
+        return _json_error(
+            _openai_error,
+            "Protected approval detection failed",
+            code="protected_approval_detection_failed",
+            status=500,
+        )
 
     if protected_active:
         # Protected runs never enter the generic choice/queue resolver.  In
@@ -1163,6 +1210,7 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    _unregister_approval_notify(self._run_approval_sessions.get(run_id))
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")

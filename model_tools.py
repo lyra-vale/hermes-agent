@@ -678,8 +678,15 @@ def _emit_post_tool_call_hook(
             return
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
+        observer_args: Dict[str, Any] = {}
+        try:
+            from tools.protected_api_approval import safe_protected_observer_args
+            observer_args = safe_protected_observer_args(function_name, function_args)
+        except Exception:
+            # Diagnostic sanitization is fail-closed for protected runs.
+            observer_args = {}
         invoke_hook(
-            "post_tool_call", tool_name=function_name, args=function_args, result=result,
+            "post_tool_call", tool_name=function_name, args=observer_args, result=result,
             **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
             middleware_trace=list(middleware_trace or []),
@@ -825,14 +832,11 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
                 )
         except Exception:
             # A protected dispatch check is a security boundary: an import or
-            # verifier failure must not turn a protected action into an
-            # unguarded registry call.  The no-policy path remains a no-op.
-            try:
-                from tools.protected_api_approval import current_protected_api_run_binding
-                if current_protected_api_run_binding() is not None:
-                    return tool_error("BLOCKED: protected API approval verification failed")
-            except Exception:
-                pass
+            # verifier failure must never turn a protected action into an
+            # unguarded registry call.  Fail closed even when context lookup
+            # itself is unavailable; there is no safe way to prove this is a
+            # legacy, unprotected call at this boundary.
+            return tool_error("BLOCKED: protected API approval verification failed")
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
@@ -858,7 +862,13 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: Dict[st
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if has_hook("transform_tool_result"):
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
-            hook_results = invoke_hook("transform_tool_result", tool_name=function_name, args=function_args,
+            observer_args: Dict[str, Any] = {}
+            try:
+                from tools.protected_api_approval import safe_protected_observer_args
+                observer_args = safe_protected_observer_args(function_name, function_args)
+            except Exception:
+                observer_args = {}
+            hook_results = invoke_hook("transform_tool_result", tool_name=function_name, args=observer_args,
                                        result=result, **ids.hook_kwargs(), duration_ms=duration_ms,
                                        status=status, error_type=error_type, error_message=error_message)
             return next((r for r in hook_results if isinstance(r, str)), result)
@@ -897,12 +907,14 @@ def handle_function_call(
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
-        observer_args = function_args
+        observer_args: Dict[str, Any] = {}
         try:
-            from tools.protected_api_approval import protected_observer_args
-            observer_args = protected_observer_args(function_name, function_args)
+            from tools.protected_api_approval import safe_protected_observer_args
+            observer_args = safe_protected_observer_args(function_name, function_args)
         except Exception:
-            pass
+            # Observer diagnostics are not an authorization path; if their
+            # sanitizer is unavailable, never echo a protected action.
+            observer_args = {}
         _emit_post_tool_call_hook(function_name=function_name, function_args=observer_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result

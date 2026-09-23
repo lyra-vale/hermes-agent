@@ -31,15 +31,19 @@ MAX_CANONICAL_ACTION_BYTES = 64 * 1024
 MAX_CANONICAL_ACTION_DEPTH = 32
 MAX_CANONICAL_STRING_BYTES = 32 * 1024
 MAX_IDENTITY_LENGTH = 256
+MAX_REDACTED_DESCRIPTION_LENGTH = 256
 
 __all__ = [
     "CanonicalActionError", "ProtectedApprovalError", "ProtectedApiRunApprovalPolicy",
     "ProtectedApiRunApprovalStore", "ProtectedApiRunBinding", "MAX_CANONICAL_ACTION_BYTES", "MAX_CANONICAL_ACTION_DEPTH",
+    "MAX_REDACTED_DESCRIPTION_LENGTH",
     "bind_protected_api_run", "attach_protected_api_run_policy",
     "require_protected_api_run_approval", "verify_protected_dispatch", "canonical_action_json",
     "canonical_action_digest", "canonical_args_json", "canonical_args_digest",
     "normalize_registered_tool_name", "set_current_api_run_context", "reset_current_api_run_context",
     "submit_protected_api_approval", "is_protected_api_run", "retire_protected_api_run",
+    "protected_api_run_status_payload",
+    "protected_observer_args", "safe_protected_observer_args",
 ]
 
 _REQUIRED_APPROVAL_FIELDS = frozenset({"request_id", "action_digest", "choice"})
@@ -75,6 +79,7 @@ class ProtectedApiRunApprovalPolicy:
     expires_at: float
     run_id: Optional[str] = None
     approval_session: Optional[str] = None
+    redacted_description: str = ""
 
     def __init__(
         self,
@@ -86,6 +91,7 @@ class ProtectedApiRunApprovalPolicy:
         expires_at: float,
         run_id: Optional[str] = None,
         approval_session: Optional[str] = None,
+        redacted_description: Optional[str] = None,
     ) -> None:
         names = frozenset(_normalize_allowlist_name(name) for name in allowed_tool_names)
         if not names:
@@ -98,6 +104,7 @@ class ProtectedApiRunApprovalPolicy:
             _validate_identity(run_id, "run_id")
         if approval_session is not None:
             _validate_identity(approval_session, "approval_session")
+        description = _normalize_redacted_description(redacted_description)
         object.__setattr__(self, "allowed_tool_names", names)
         object.__setattr__(self, "user_session_id", user_session_id)
         object.__setattr__(self, "hermes_session_id", hermes_session_id)
@@ -105,6 +112,7 @@ class ProtectedApiRunApprovalPolicy:
         object.__setattr__(self, "expires_at", checked_expiry)
         object.__setattr__(self, "run_id", run_id)
         object.__setattr__(self, "approval_session", approval_session)
+        object.__setattr__(self, "redacted_description", description)
 
     def allows_tool(self, tool_name: str) -> bool:
         """Return whether *tool_name* is an exact, case-sensitive allowlist member."""
@@ -131,6 +139,7 @@ class ProtectedApiRunApprovalPolicy:
             expires_at=self.expires_at,
             run_id=run_id,
             approval_session=approval_session,
+            redacted_description=self.redacted_description,
         )
 
     def attach(self, **kwargs: Any) -> "ProtectedApiRunBinding":
@@ -194,6 +203,50 @@ _CURRENT_BINDING: contextvars.ContextVar[Optional[ProtectedApiRunBinding]] = con
 _CURRENT_AUTHORIZATION: contextvars.ContextVar[Optional[_DispatchAuthorization]] = contextvars.ContextVar(
     "hermes_protected_api_run_authorization", default=None
 )
+
+_ACTIVE_STORE_LOCK = threading.RLock()
+_ACTIVE_STORES: Dict[tuple[str, str], set[Any]] = {}
+
+
+def _track_active_store(key: tuple[str, str], store: Any) -> None:
+    with _ACTIVE_STORE_LOCK:
+        _ACTIVE_STORES.setdefault(key, set()).add(store)
+
+
+def _untrack_active_store(key: tuple[str, str], store: Any) -> None:
+    with _ACTIVE_STORE_LOCK:
+        stores = _ACTIVE_STORES.get(key)
+        if stores is None:
+            return
+        stores.discard(store)
+        if not stores:
+            _ACTIVE_STORES.pop(key, None)
+
+
+def _active_stores_for(run_id: str, approval_session: Optional[str] = None) -> tuple[Any, ...]:
+    with _ACTIVE_STORE_LOCK:
+        if approval_session is not None:
+            return tuple(_ACTIVE_STORES.get((run_id, approval_session), ()))
+        return tuple({
+            store
+            for (stored_run_id, _stored_session), stores in _ACTIVE_STORES.items()
+            if stored_run_id == run_id
+            for store in stores
+        })
+
+
+def _normalize_redacted_description(value: Optional[str]) -> str:
+    """Normalize the server-owned display text without consulting action arguments."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("redacted_description must be a string")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("redacted_description contains a control character")
+    compact = " ".join(value.split())
+    if len(compact) <= MAX_REDACTED_DESCRIPTION_LENGTH:
+        return compact
+    return compact[: MAX_REDACTED_DESCRIPTION_LENGTH - 1].rstrip() + "…"
 
 
 def _validate_identity(value: str, label: str) -> str:
@@ -301,6 +354,7 @@ def canonical_action_digest(tool_name: str, args: Mapping[str, Any]) -> str:
 
 def _safe_metadata(pending: _PendingApproval) -> Dict[str, Any]:
     """Build the only payload permitted to cross the pending-approval callback."""
+    description = pending.policy.redacted_description or f"Approve protected {pending.tool_name} action"
     return {
         "approval_type": "protected_api_run",
         "run_id": pending.run_id,
@@ -310,6 +364,7 @@ def _safe_metadata(pending: _PendingApproval) -> Dict[str, Any]:
         "action_digest": pending.action_digest,
         "expires_at": pending.expires_at,
         "choices": ["once", "deny"],
+        "redacted_description": _normalize_redacted_description(description),
     }
 
 
@@ -349,8 +404,10 @@ class ProtectedApiRunApprovalStore:
                     )
                 if pending_callback is not None and existing[1] is not pending_callback:
                     self._policies[key] = (existing[0], pending_callback)
+                _track_active_store(key, self)
                 return existing[0]
             self._policies[key] = (policy, pending_callback)
+            _track_active_store(key, self)
         return policy
 
     def is_protected_run(self, run_id: str, approval_session: Optional[str] = None) -> bool:
@@ -358,6 +415,23 @@ class ProtectedApiRunApprovalStore:
             if approval_session is not None:
                 return (run_id, approval_session) in self._policies
             return any(key[0] == run_id for key in self._policies)
+
+    def binding_for(self, run_id: str, approval_session: str) -> Optional[ProtectedApiRunBinding]:
+        with self._lock:
+            registered = self._policies.get((run_id, approval_session))
+            if registered is None:
+                return None
+            return ProtectedApiRunBinding(registered[0], self, registered[1])
+
+    def status_payload(
+        self, *, run_id: str, approval_session: str, request_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a safe status envelope built from the stored policy/record."""
+        with self._lock:
+            record = self._records.get((run_id, approval_session, request_id))
+            if record is None or record.consumed:
+                return None
+            return _safe_metadata(record)
 
     def _expire_locked(self, record: _PendingApproval, *, message: str = "Protected approval expired") -> None:
         if record.consumed:
@@ -551,6 +625,7 @@ class ProtectedApiRunApprovalStore:
             ]
             for key in keys:
                 self._policies.pop(key, None)
+                _untrack_active_store(key, self)
             for record in self._records.values():
                 if record.run_id == run_id and (approval_session is None or record.approval_session == approval_session):
                     self._expire_locked(record, message="Protected API run retired")
@@ -655,17 +730,59 @@ def bind_protected_api_run(
         reset_current_api_run_context(context_tokens)
 
 
+def _resolve_current_protected_binding() -> Optional[ProtectedApiRunBinding]:
+    """Resolve a policy registered for the current API run before generic fallback."""
+    binding = _CURRENT_BINDING.get()
+    if binding is not None:
+        return binding
+    context = _CURRENT_API_RUN_CONTEXT.get()
+    if context is None:
+        return None
+    stores = _active_stores_for(context.run_id, context.approval_session)
+    if not stores:
+        return None
+    if len(stores) != 1:
+        raise ProtectedApprovalError(
+            "Protected policy has conflicting active stores",
+            code="approval_store_conflict",
+            status=500,
+        )
+    binding = stores[0].binding_for(context.run_id, context.approval_session)
+    if binding is None:
+        return None
+    if binding.pending_callback is None and context.pending_callback is not None:
+        stores[0].register_policy(binding.policy, pending_callback=context.pending_callback)
+        binding = ProtectedApiRunBinding(binding.policy, stores[0], context.pending_callback)
+    _CURRENT_BINDING.set(binding)
+    return binding
+
+
 def current_protected_api_run_binding() -> Optional[ProtectedApiRunBinding]:
     """Return the current binding for core dispatch and narrow adapters."""
-    return _CURRENT_BINDING.get()
+    return _resolve_current_protected_binding()
 
 
 def protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return no raw arguments while a protected action is being observed."""
-    binding = _CURRENT_BINDING.get()
-    if binding is not None and binding.policy.allows_tool(tool_name):
+    """Return no raw arguments for any action observed inside a protected run."""
+    if _resolve_current_protected_binding() is not None:
         return {}
     return dict(args)
+
+
+def safe_protected_observer_args(tool_name: str, args: Mapping[str, Any]) -> Dict[str, Any]:
+    """Fail closed when observer sanitization itself cannot produce a payload."""
+    try:
+        return protected_observer_args(tool_name, args)
+    except Exception:
+        try:
+            if _resolve_current_protected_binding() is not None:
+                return {}
+        except Exception:
+            return {}
+        try:
+            return dict(args)
+        except Exception:
+            return {}
 
 
 def has_current_protected_dispatch_authorization() -> bool:
@@ -676,6 +793,17 @@ def has_current_protected_dispatch_authorization() -> bool:
 def clear_current_protected_dispatch_authorization() -> None:
     """Clear the one-use authorization token after a blocked/finished dispatch."""
     _CURRENT_AUTHORIZATION.set(None)
+
+
+def _binding_is_active(binding: ProtectedApiRunBinding) -> bool:
+    run_id = binding.policy.run_id
+    approval_session = binding.policy.approval_session
+    if not run_id or not approval_session:
+        return False
+    try:
+        return bool(binding.store.is_protected_run(run_id, approval_session))
+    except Exception:
+        return False
 
 
 def require_protected_api_run_approval(
@@ -691,7 +819,10 @@ def require_protected_api_run_approval(
     calls it after request/pre-tool transformations and regardless of skip flags,
     so the adapter hook is not an authorization boundary.
     """
-    binding = _CURRENT_BINDING.get()
+    try:
+        binding = _resolve_current_protected_binding()
+    except Exception:
+        return {"approved": False, "message": "BLOCKED: protected policy resolution failed"}
     if policy is not None:
         if binding is None:
             binding = attach_protected_api_run_policy(policy, store=store)
@@ -707,7 +838,11 @@ def require_protected_api_run_approval(
                 return {"approved": False, "message": "BLOCKED: protected policy context changed"}
     if binding is None:
         return {"approved": True, "protected": False}
+    if not _binding_is_active(binding):
+        clear_current_protected_dispatch_authorization()
+        return {"approved": False, "message": "BLOCKED: protected policy is not active for this run"}
     if not binding.policy.allows_tool(tool_name):
+        clear_current_protected_dispatch_authorization()
         return {"approved": False, "message": f"BLOCKED: tool '{tool_name}' is not in the protected allowlist"}
     authorization = _CURRENT_AUTHORIZATION.get()
     if authorization is not None and authorization.binding == binding:
@@ -741,12 +876,19 @@ def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consum
     fails closed.  ``consume=False`` is the outer agent preflight; the registry
     boundary uses the default one-use consume operation.
     """
-    binding = _CURRENT_BINDING.get()
+    try:
+        binding = _resolve_current_protected_binding()
+    except Exception:
+        clear_current_protected_dispatch_authorization()
+        return False
     if binding is None:
         return True
+    if not _binding_is_active(binding):
+        clear_current_protected_dispatch_authorization()
+        return False
     authorization = _CURRENT_AUTHORIZATION.get()
     if authorization is None:
-        return not binding.policy.allows_tool(tool_name)
+        return False
     try:
         digest = canonical_action_digest(tool_name, args)
         args_digest = canonical_args_digest(args)
@@ -769,19 +911,57 @@ def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consum
 
 
 def is_protected_api_run(run_id: str, approval_session: Optional[str] = None) -> bool:
-    """Return whether the default API approval ledger owns a protected run."""
-    return _DEFAULT_STORE.is_protected_run(run_id, approval_session)
+    """Return whether any active protected policy owns the run."""
+    return bool(_active_stores_for(run_id, approval_session))
+
+
+def protected_api_run_status_payload(
+    run_id: str, approval_session: str, request_id: str
+) -> Dict[str, Any]:
+    """Build the protected approval status from the server-held pending record."""
+    stores = _active_stores_for(run_id, approval_session)
+    if not stores:
+        stores = (_DEFAULT_STORE,)
+    if len(stores) != 1:
+        raise ProtectedApprovalError(
+            "Protected approval status has conflicting policy stores",
+            code="approval_status_unavailable",
+            status=500,
+        )
+    payload = stores[0].status_payload(
+        run_id=run_id, approval_session=approval_session, request_id=request_id
+    )
+    if payload is None:
+        raise ProtectedApprovalError(
+            "Protected approval request is not pending",
+            code="approval_not_pending",
+        )
+    return payload
 
 
 def submit_protected_api_approval(
     *, run_id: str, approval_session: str, body: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    """Resolve a strict API approval on the default server ledger."""
-    return _DEFAULT_STORE.submit_approval(
+    """Resolve a strict API approval on the run's active policy store."""
+    stores = _active_stores_for(run_id, approval_session)
+    if not stores:
+        return _DEFAULT_STORE.submit_approval(
+            run_id=run_id, approval_session=approval_session, body=body
+        )
+    if len(stores) != 1:
+        raise ProtectedApprovalError(
+            "Protected approval has conflicting active policy stores",
+            code="approval_store_conflict",
+            status=500,
+        )
+    return stores[0].submit_approval(
         run_id=run_id, approval_session=approval_session, body=body
     )
 
 
 def retire_protected_api_run(run_id: str, approval_session: Optional[str] = None) -> None:
-    """Retire a protected run from the default server ledger."""
-    _DEFAULT_STORE.retire_run(run_id, approval_session)
+    """Retire every active policy store for a protected run."""
+    stores = set(_active_stores_for(run_id, approval_session))
+    stores.add(_DEFAULT_STORE)
+    for store in stores:
+        store.retire_run(run_id, approval_session)
