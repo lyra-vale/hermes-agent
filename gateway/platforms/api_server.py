@@ -1459,7 +1459,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None
         cfg = getattr(self.gateway_runner, "config", None)
         if not getattr(cfg, "multiplex_profiles", False):
-            return None if _prefix_names_served_profile(profile) else _PROFILE_REJECTED
+            # Preserve a validated *named* standalone profile so downstream
+            # API-session bindings retain its real identity. The default profile
+            # remains unscoped for backward compatibility.
+            if not _prefix_names_served_profile(profile):
+                return _PROFILE_REJECTED
+            return profile if profile != "default" else None
         try:
             from hermes_cli.profiles import profiles_to_serve
             served = {name for name, _ in profiles_to_serve(multiplex=True)}

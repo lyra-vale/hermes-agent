@@ -42,12 +42,13 @@ class TestResolverWithMultiplexOff:
     def test_no_prefix_is_untouched(self, adapter):
         assert adapter._resolve_request_profile(_request(None)) is None
 
-    def test_prefix_naming_own_profile_is_honored(self, adapter, monkeypatch):
+    def test_prefix_naming_own_profile_binds_named_profile(self, adapter, monkeypatch):
+        """A standalone named profile must retain its identity for protected API hooks."""
         monkeypatch.setattr(
             "hermes_cli.profiles.profile_matches_home",
             lambda name, home=None: name == "researcher",
         )
-        assert adapter._resolve_request_profile(_request("researcher")) is None
+        assert adapter._resolve_request_profile(_request("researcher")) == "researcher"
 
     def test_prefix_naming_default_on_default_home_is_honored(self, adapter, monkeypatch):
         monkeypatch.setattr(
