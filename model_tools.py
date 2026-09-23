@@ -817,6 +817,22 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        try:
+            from tools.protected_api_approval import verify_protected_dispatch
+            if not verify_protected_dispatch(function_name, next_args):
+                return tool_error(
+                    "BLOCKED: the protected API approval did not authorize this exact action"
+                )
+        except Exception:
+            # A protected dispatch check is a security boundary: an import or
+            # verifier failure must not turn a protected action into an
+            # unguarded registry call.  The no-policy path remains a no-op.
+            try:
+                from tools.protected_api_approval import current_protected_api_run_binding
+                if current_protected_api_run_binding() is not None:
+                    return tool_error("BLOCKED: protected API approval verification failed")
+            except Exception:
+                pass
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
@@ -881,7 +897,13 @@ def handle_function_call(
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
-        _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
+        observer_args = function_args
+        try:
+            from tools.protected_api_approval import protected_observer_args
+            observer_args = protected_observer_args(function_name, function_args)
+        except Exception:
+            pass
+        _emit_post_tool_call_hook(function_name=function_name, function_args=observer_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
 
@@ -928,6 +950,26 @@ def handle_function_call(
             result, error_type, error_message = blocked
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
 
+        # This core-side gate runs even when the caller says the pre-tool hook
+        # already ran.  A protected API-run policy is intentionally independent
+        # of generic approval caches, YOLO/always choices, and hook failures.
+        try:
+            from tools.protected_api_approval import require_protected_api_run_approval
+            protected_decision = require_protected_api_run_approval(function_name, function_args)
+        except Exception:
+            protected_decision = {
+                "approved": False,
+                "message": "BLOCKED: protected API approval verification failed",
+            }
+        if not protected_decision.get("approved", False):
+            message = str(protected_decision.get("message") or "BLOCKED: protected API approval required")
+            return _emit(
+                tool_error(message),
+                status="blocked",
+                error_type="protected_api_approval",
+                error_message=message,
+            )
+
         # Any non-read/search tool resets the consecutive-read-loop counter.
         if function_name not in _READ_SEARCH_TOOLS:
             try:
@@ -945,6 +987,11 @@ def handle_function_call(
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
     except Exception as e:
+        try:
+            from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+            clear_current_protected_dispatch_authorization()
+        except Exception:
+            pass
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),

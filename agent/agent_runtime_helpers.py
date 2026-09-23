@@ -2266,15 +2266,79 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tool_start_time = time.monotonic()
 
     def _execute(next_args: dict) -> Any:
+        try:
+            from tools.protected_api_approval import require_protected_api_run_approval
+            protected_decision = require_protected_api_run_approval(function_name, next_args)
+        except Exception:
+            protected_decision = {
+                "approved": False,
+                "message": "BLOCKED: protected API approval verification failed",
+            }
+        if not protected_decision.get("approved", False):
+            message = str(protected_decision.get("message") or "BLOCKED: protected API approval required")
+            result = json.dumps({"error": message}, ensure_ascii=False)
+            emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args={},
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type="protected_api_approval",
+                error_message=message,
+                middleware_trace=_tool_middleware_trace,
+            )
+            return result
         inline_executor = resolve_invoke_tool_executor(agent, function_name)
         if inline_executor is not None:
+            try:
+                from tools.protected_api_approval import verify_protected_dispatch
+                if not verify_protected_dispatch(function_name, next_args):
+                    message = "BLOCKED: the protected API approval did not authorize this exact action"
+                    result = json.dumps({"error": message}, ensure_ascii=False)
+                    emit_terminal_post_tool_call(
+                        agent,
+                        function_name=function_name,
+                        function_args={},
+                        result=result,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=tool_call_id,
+                        status="blocked",
+                        error_type="protected_api_approval",
+                        error_message=message,
+                        middleware_trace=_tool_middleware_trace,
+                    )
+                    return result
+            except Exception:
+                message = "BLOCKED: protected API approval verification failed"
+                result = json.dumps({"error": message}, ensure_ascii=False)
+                emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args={},
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    status="blocked",
+                    error_type="protected_api_approval",
+                    error_message=message,
+                    middleware_trace=_tool_middleware_trace,
+                )
+                return result
             inline_ctx = InlineToolContext(
                 effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
             )
             result = inline_executor(agent, next_args, inline_ctx)
+            observer_args = next_args if isinstance(next_args, dict) else function_args
+            try:
+                from tools.protected_api_approval import protected_observer_args
+                observer_args = protected_observer_args(function_name, observer_args)
+            except Exception:
+                pass
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,
-                function_args=next_args if isinstance(next_args, dict) else function_args,
+                function_args=observer_args,
                 result=result, effective_task_id=effective_task_id, tool_call_id=tool_call_id,
                 duration_ms=int((time.monotonic() - tool_start_time) * 1000),
                 middleware_trace=_tool_middleware_trace,

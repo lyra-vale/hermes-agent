@@ -256,7 +256,13 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
-            _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
+            safe_preview = preview
+            with suppress(Exception):
+                from tools.protected_api_approval import current_protected_api_run_binding
+                binding = current_protected_api_run_binding()
+                if binding is not None and binding.policy.allows_tool(tool_name or ""):
+                    safe_preview = None
+            _push(_run_event(run_id, event_type, **fields(tool_name, safe_preview, kwargs)))
         elif event_type in {"subagent.start", "subagent.complete"}:
             event = _run_event(run_id, event_type)
             if preview is not None:
@@ -445,6 +451,9 @@ def _forget_run(self, run_id: str, *tables) -> None:
 
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
+    with suppress(Exception):
+        from tools.protected_api_approval import retire_protected_api_run
+        retire_protected_api_run(run_id)
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
                 self._stopping_run_ids)
 
@@ -716,6 +725,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     # accumulate until the OS refuses new process spawns.
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.protected_api_approval import reset_current_api_run_context, set_current_api_run_context
     from tools.file_readonly_scope import bind_file_readonly_roots, reset_file_readonly_roots
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
@@ -751,6 +761,18 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 # This is deliberately inside the executor thread: ContextVars do
                 # not propagate through run_in_executor automatically.
                 resets.append((bind_file_readonly_roots(run.file_readonly_roots), reset_file_readonly_roots))
+            # A profile-local Calendar adapter may explicitly attach a
+            # ProtectedApiRunApprovalPolicy from its pre-tool hook.  The run
+            # identity and API event bridge are core-owned and cannot be
+            # supplied by tool arguments or generic approval state.
+            resets.append((
+                set_current_api_run_context(
+                    run_id=run.run_id,
+                    approval_session=run.approval_session_key,
+                    pending_callback=approval_notify,
+                ),
+                reset_current_api_run_context,
+            ))
             register_gateway_notify(run.approval_session_key, approval_notify)
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
@@ -782,6 +804,23 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
         event = dict(approval_data or {})
+        if event.get("approval_type") == "protected_api_run":
+            # The protected ledger already supplies a bounded, digest-only
+            # envelope. Rebuild it from the allowlist rather than passing
+            # through plugin-added args, commands, credentials, or paths.
+            event = {
+                key: event[key]
+                for key in (
+                    "approval_type", "request_id", "tool_name", "args_digest", "action_digest", "expires_at",
+                )
+                if key in event
+            }
+            event["choices"] = ["once", "deny"]
+            event.update(_run_event(run_id, "approval.request", choices=["once", "deny"]))
+            self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
+            with suppress(Exception):
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            return
         # Clients must never receive the raw flagged command: redact before it hits the stream.
         # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
         # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
@@ -993,6 +1032,49 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    if not isinstance(body, dict):
+        return _json_error(_openai_error, "Approval body must be a JSON object", code="invalid_approval_body", status=400)
+
+    approval_session_key = self._run_approval_sessions.get(run_id)
+    try:
+        from tools.protected_api_approval import (
+            ProtectedApprovalError,
+            is_protected_api_run,
+            submit_protected_api_approval,
+        )
+        protected_active = bool(
+            approval_session_key and is_protected_api_run(run_id, approval_session_key)
+        )
+    except Exception:
+        ProtectedApprovalError = None  # type: ignore[assignment]
+        protected_active = False
+
+    if protected_active:
+        # Protected runs never enter the generic choice/queue resolver.  In
+        # particular, aliases, FIFO, resolve_all, session/always caches, and
+        # approvals-off settings cannot authorize a Calendar write.
+        try:
+            response = submit_protected_api_approval(
+                run_id=run_id,
+                approval_session=approval_session_key,
+                body=body,
+            )
+        except Exception as exc:
+            if ProtectedApprovalError is not None and isinstance(exc, ProtectedApprovalError):
+                return _json_error(_openai_error, str(exc), code=exc.code, status=exc.status)
+            logger.exception("[api_server] protected approval resolution failed for run %s", run_id)
+            return _json_error(_openai_error, "Protected approval resolution failed", code="approval_failed", status=500)
+        _mark_run_event(
+            self,
+            run_id,
+            "approval.responded",
+            choice=response["choice"],
+            request_id=response["request_id"],
+            action_digest=response["action_digest"],
+            resolved=1,
+        )
+        return web.json_response(response)
+
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
     room_scoped = bool(self._room_grant_token(request))
@@ -1001,7 +1083,6 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     # Room grants may resolve exactly one request and never widen to session/always.
     allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
     resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
-    approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
         (raw_request_id is not None and (not request_id or len(request_id) > 256),
          "Approval request_id is invalid.", "invalid_approval_request", 400),

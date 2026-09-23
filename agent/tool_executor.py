@@ -270,10 +270,16 @@ class _ToolCallRef:
         """Emit the one terminal ``post_tool_call`` for this call (``outcome`` = status /
         error_type / error_message / duration_ms). Resolved through the module attribute so
         tests patching ``_emit_terminal_post_tool_call`` still intercept."""
+        observer_args = self.args
+        try:
+            from tools.protected_api_approval import protected_observer_args
+            observer_args = protected_observer_args(self.name, observer_args)
+        except Exception:
+            pass
         _emit_terminal_post_tool_call(
             agent,
             function_name=self.name,
-            function_args=self.args,
+            function_args=observer_args,
             result=result,
             effective_task_id=self.task_id,
             tool_call_id=self.call_id,
@@ -616,7 +622,13 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
         result = agent._guardrail_block_result(guardrail_decision)
         error_type = "guardrail_block"
         error_message = getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy"
-    ref.emit_post(agent, result, status="blocked", error_type=error_type, error_message=error_message)
+    if block_error_type == "protected_api_approval":
+        # Protected approval events contain digests/opaque metadata only; the
+        # raw action must not leak through the terminal observer on a denial.
+        safe_ref = _ToolCallRef(ref.name, {}, ref.task_id, ref.call_id, ref.trace)
+        safe_ref.emit_post(agent, result, status="blocked", error_type=error_type, error_message=error_message)
+    else:
+        ref.emit_post(agent, result, status="blocked", error_type=error_type, error_message=error_message)
     return result
 
 
@@ -682,13 +694,86 @@ def _dispatch_authorized_once(
             block_message=block_message, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
+    # This is the agent-side dispatch seam used by both the concurrent and
+    # sequential executors.  It is deliberately after execution middleware
+    # has produced the final arguments and independent of the generic human
+    # approval gate above.
+    try:
+        from tools.protected_api_approval import require_protected_api_run_approval
+        protected_decision = require_protected_api_run_approval(ref.name, ref.args)
+    except Exception:
+        protected_decision = {
+            "approved": False,
+            "message": "BLOCKED: protected API approval verification failed",
+        }
+    if not protected_decision.get("approved", False):
+        _advance_start_order()
+        state.blocked = True
+        message = str(protected_decision.get("message") or "BLOCKED: protected API approval required")
+        return _blocked_tool_result(
+            agent,
+            ref,
+            block_message=message,
+            block_error_type="protected_api_approval",
+            guardrail_decision=None,
+        )
+
+    # Pre-tool adapters run before this outer execution middleware.  If one
+    # obtained a protected token, validate the exact middleware output here,
+    # without consuming the token; model_tools/inline dispatch consumes it at
+    # the final core boundary.  With no token, defer to that boundary so a
+    # skipped or failed hook cannot bypass the protected gate.
+    try:
+        from tools.protected_api_approval import (
+            has_current_protected_dispatch_authorization,
+            verify_protected_dispatch,
+        )
+        if (
+            has_current_protected_dispatch_authorization()
+            and not verify_protected_dispatch(ref.name, ref.args, consume=False)
+        ):
+            _advance_start_order()
+            state.blocked = True
+            message = "BLOCKED: the protected API approval did not authorize this exact action"
+            return _blocked_tool_result(
+                agent,
+                ref,
+                block_message=message,
+                block_error_type="protected_api_approval",
+                guardrail_decision=None,
+            )
+    except Exception:
+        # A protected token is only present when the protected module has
+        # established a policy; fail closed rather than dispatching a token
+        # whose final verifier is unavailable.
+        try:
+            from tools.protected_api_approval import has_current_protected_dispatch_authorization
+            if has_current_protected_dispatch_authorization():
+                _advance_start_order()
+                state.blocked = True
+                message = "BLOCKED: protected API approval verification failed"
+                return _blocked_tool_result(
+                    agent,
+                    ref,
+                    block_message=message,
+                    block_error_type="protected_api_approval",
+                    guardrail_decision=None,
+                )
+        except Exception:
+            pass
+
     if ref.name == "memory":
         agent._turns_since_memory = 0
     elif ref.name == "skill_manage":
         agent._iters_since_skill = 0
 
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    try:
+        return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    finally:
+        with contextlib.suppress(Exception):
+            from tools.protected_api_approval import clear_current_protected_dispatch_authorization
+            clear_current_protected_dispatch_authorization()
 
 
 def _run_agent_tool_execution_middleware(
