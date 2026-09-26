@@ -1001,6 +1001,331 @@ def test_generic_always_or_approvals_off_cannot_authorize_protected_call(monkeyp
     assert result["approved"] is False
 
 
+def test_description_fn_is_called_with_normalized_tool_and_canonical_args():
+    """description_fn receives normalized tool name and sorted canonical args at request time."""
+    received = []
+
+    def description_fn(tool_name, args):
+        received.append({"tool_name": tool_name, "args": dict(args)})
+        return "Create reminder: Buy milk"
+
+    policy = _policy(description_fn=description_fn)
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    result = {}
+    # Pass args deliberately unsorted to verify canonical normalization
+    unsorted_args = {"path": "/reminders/Shopping.json", "content": "Buy milk"}
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", unsorted_args)
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+    assert len(received) == 1
+    assert received[0]["tool_name"] == "write_file"
+    # Canonical args have sorted keys
+    assert list(received[0]["args"].keys()) == sorted(received[0]["args"].keys())
+    assert received[0]["args"]["path"] == "/reminders/Shopping.json"
+    assert received[0]["args"]["content"] == "Buy milk"
+
+
+def test_description_fn_result_appears_in_callback_and_status_payload_with_identical_string():
+    """Per-call description is stored once and used identically in callback event and status_payload."""
+    expected_description = "Complete reminder: Buy milk (id=abc123)"
+
+    def description_fn(tool_name, args):
+        return expected_description
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(
+        run_id="run_desc_fn_match",
+        approval_session="approval_desc_fn_match",
+        description_fn=description_fn,
+    )
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        callback_description = events[0]["redacted_description"]
+        payload = protected.protected_api_run_status_payload(
+            policy.run_id, policy.approval_session, events[0]["request_id"]
+        )
+        # Both the callback and status_payload must return the exact same stored string
+        assert payload["redacted_description"] == callback_description == expected_description
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+
+def test_description_fn_failure_blocks_approval_before_callback():
+    """If description_fn raises, the request is blocked and no callback fires."""
+
+    def description_fn(tool_name, args):
+        raise ValueError("cannot determine description for this reminder action")
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(description_fn=description_fn)
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+    assert result["approved"] is False
+    assert "description" in result["message"].lower()
+    assert events == []  # callback never fired; no pending record was created
+
+
+def test_description_fn_exceeding_max_length_blocks_approval():
+    """description_fn returning more than MAX_ACTION_DESCRIPTION_LENGTH characters blocks the request."""
+
+    def description_fn(tool_name, args):
+        return "x" * (protected.MAX_ACTION_DESCRIPTION_LENGTH + 1)
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(description_fn=description_fn)
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+    assert result["approved"] is False
+    assert events == []  # callback never fired
+
+
+def test_description_fn_at_exact_max_length_is_accepted():
+    """description_fn returning exactly MAX_ACTION_DESCRIPTION_LENGTH characters is accepted."""
+
+    def description_fn(tool_name, args):
+        return "x" * protected.MAX_ACTION_DESCRIPTION_LENGTH
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(description_fn=description_fn)
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        assert len(events[0]["redacted_description"]) == protected.MAX_ACTION_DESCRIPTION_LENGTH
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+
+def test_description_fn_overrides_static_redacted_description():
+    """Per-call description_fn result takes precedence over the static policy.redacted_description."""
+
+    def description_fn(tool_name, args):
+        return "Delete reminder: Old shopping task (id=xyz789)"
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(
+        redacted_description="Generic reminder action",
+        description_fn=description_fn,
+    )
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        assert events[0]["redacted_description"] == "Delete reminder: Old shopping task (id=xyz789)"
+        assert events[0]["redacted_description"] != "Generic reminder action"
+        store.retire_run(policy.run_id, policy.approval_session)
+        worker.join(timeout=2)
+
+
+def test_description_fn_propagates_through_for_run():
+    """description_fn is preserved after policy.for_run() binding."""
+    calls = []
+
+    def description_fn(tool_name, args):
+        calls.append(tool_name)
+        return "Update reminder: Grocery list"
+
+    base = _policy(description_fn=description_fn)
+    bound_policy = base.for_run(run_id=base.run_id, approval_session=base.approval_session)
+    assert bound_policy.description_fn is description_fn
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    result = {}
+    with _bound(bound_policy, store=store, pending_callback=events.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events))
+        assert events[0]["redacted_description"] == "Update reminder: Grocery list"
+        assert calls == ["write_file"]
+        store.retire_run(bound_policy.run_id, bound_policy.approval_session)
+        worker.join(timeout=2)
+
+
+def test_description_fn_control_characters_block_approval():
+    """description_fn returning a string with control characters blocks the request."""
+
+    def description_fn(tool_name, args):
+        return "Create reminder\x00 title"
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(description_fn=description_fn)
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+    assert result["approved"] is False
+    assert events == []
+
+
+def test_description_fn_returning_empty_or_whitespace_blocks_approval():
+    """description_fn returning an empty or whitespace-only string must block the request, not fall back."""
+    for empty_value in ("", "   ", "\t\n  \t"):
+        def description_fn(tool_name, args, _v=empty_value):
+            return _v
+
+        store = protected.ProtectedApiRunApprovalStore()
+        events = []
+        policy = _policy(description_fn=description_fn)
+        result = {}
+
+        with _bound(policy, store=store, pending_callback=events.append):
+            result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+        assert result["approved"] is False, f"empty value {empty_value!r} should block, not fall back"
+        assert events == [], f"callback fired for empty value {empty_value!r}; no pending record should be created"
+
+
+def test_description_fn_exception_text_is_not_leaked_in_blocked_response():
+    """Exception text raised by description_fn must not appear in the BLOCKED message."""
+    secret = "user_token_abc123secret_xyz"
+
+    def description_fn(tool_name, args):
+        raise ValueError(f"internal error processing token: {secret}")
+
+    store = protected.ProtectedApiRunApprovalStore()
+    events = []
+    policy = _policy(description_fn=description_fn)
+    result = {}
+
+    with _bound(policy, store=store, pending_callback=events.append):
+        result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+    assert result["approved"] is False
+    assert secret not in result.get("message", ""), "exception text must not be echoed in the blocked message"
+    assert events == []
+
+
+def test_unicode_direction_controls_block_approval():
+    """C1 controls and Unicode bidi overrides in description_fn must block approval before the callback fires."""
+    for bad_char in ("\u0080", "‮"):  # C1 non-whitespace control; RIGHT-TO-LEFT OVERRIDE
+        def description_fn(tool_name, args, _c=bad_char):
+            return f"Create reminder{_c}title"
+
+        store = protected.ProtectedApiRunApprovalStore()
+        events = []
+        policy = _policy(description_fn=description_fn)
+        result = {}
+
+        with _bound(policy, store=store, pending_callback=events.append):
+            result.update(protected.require_protected_api_run_approval("write_file", _action()))
+
+        assert result["approved"] is False, (
+            f"U+{ord(bad_char):04X} in description_fn must block approval"
+        )
+        assert events == [], (
+            f"callback fired for U+{ord(bad_char):04X}; no pending record should be created"
+        )
+
+
+def test_description_fn_digest_unchanged_by_description():
+    """Adding a description_fn does not alter the action_digest or args_digest in the event."""
+    store_with = protected.ProtectedApiRunApprovalStore()
+    store_without = protected.ProtectedApiRunApprovalStore()
+    events_with = []
+    events_without = []
+
+    policy_with = _policy(
+        run_id="run_desc_digest_with",
+        approval_session="approval_desc_digest_with",
+        description_fn=lambda t, a: "Some description",
+    )
+    policy_without = _policy(
+        run_id="run_desc_digest_without",
+        approval_session="approval_desc_digest_without",
+    )
+    result_with = {}
+    result_without = {}
+
+    with _bound(policy_with, store=store_with, pending_callback=events_with.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result_with.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events_with))
+        store_with.retire_run(policy_with.run_id, policy_with.approval_session)
+        worker.join(timeout=2)
+
+    with _bound(policy_without, store=store_without, pending_callback=events_without.append):
+        worker = threading.Thread(
+            target=_thread_target(
+                lambda: result_without.update(
+                    protected.require_protected_api_run_approval("write_file", _action())
+                )
+            )
+        )
+        worker.start()
+        assert _wait_for(lambda: bool(events_without))
+        store_without.retire_run(policy_without.run_id, policy_without.approval_session)
+        worker.join(timeout=2)
+
+    # Digests must be identical regardless of description_fn presence
+    assert events_with[0]["action_digest"] == events_without[0]["action_digest"]
+    assert events_with[0]["args_digest"] == events_without[0]["args_digest"]
+    # Description presence does not change tool_name
+    assert events_with[0]["tool_name"] == events_without[0]["tool_name"]
+
+
 def _thread_target(callback):
     context = contextvars.copy_context()
     return lambda: context.run(callback)

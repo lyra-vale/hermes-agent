@@ -23,6 +23,7 @@ import math
 import secrets
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
@@ -33,6 +34,7 @@ MAX_CANONICAL_ACTION_DEPTH = 32
 MAX_CANONICAL_STRING_BYTES = 32 * 1024
 MAX_IDENTITY_LENGTH = 256
 MAX_REDACTED_DESCRIPTION_LENGTH = 256
+MAX_ACTION_DESCRIPTION_LENGTH = 512
 MAX_PENDING_APPROVAL_RECORDS = 1024
 MAX_RETIRED_RUN_TOMBSTONES = 4096
 RETIRED_RUN_TOMBSTONE_TTL_SECONDS = 300.0
@@ -40,7 +42,7 @@ RETIRED_RUN_TOMBSTONE_TTL_SECONDS = 300.0
 __all__ = [
     "CanonicalActionError", "ProtectedApprovalError", "ProtectedApiRunApprovalPolicy",
     "ProtectedApiRunApprovalStore", "ProtectedApiRunBinding", "MAX_CANONICAL_ACTION_BYTES", "MAX_CANONICAL_ACTION_DEPTH",
-    "MAX_REDACTED_DESCRIPTION_LENGTH", "MAX_PENDING_APPROVAL_RECORDS",
+    "MAX_REDACTED_DESCRIPTION_LENGTH", "MAX_ACTION_DESCRIPTION_LENGTH", "MAX_PENDING_APPROVAL_RECORDS",
     "MAX_RETIRED_RUN_TOMBSTONES", "RETIRED_RUN_TOMBSTONE_TTL_SECONDS",
     "bind_protected_api_run", "attach_protected_api_run_policy",
     "require_protected_api_run_approval", "verify_protected_dispatch", "canonical_action_json",
@@ -77,6 +79,14 @@ class ProtectedApiRunApprovalPolicy:
     ``run_id`` and ``approval_session`` may be omitted when the policy is
     attached from an API-run context.  All three user-facing identity fields
     are required from the adapter; the core never invents or inherits them.
+
+    ``description_fn`` is an optional per-call callback that receives the
+    normalized tool name and canonical args dict at request time and returns
+    a human-readable description (≤ ``MAX_ACTION_DESCRIPTION_LENGTH`` chars)
+    for that specific action.  If set, its result overrides
+    ``redacted_description`` in the pending event and status payload.  The
+    function must not raise and must return a valid string; any failure blocks
+    the request before the pending record is created.
     """
 
     allowed_tool_names: frozenset[str]
@@ -87,6 +97,7 @@ class ProtectedApiRunApprovalPolicy:
     run_id: Optional[str] = None
     approval_session: Optional[str] = None
     redacted_description: str = ""
+    description_fn: Optional[Callable[[str, Mapping[str, Any]], str]] = None
 
     def __init__(
         self,
@@ -99,6 +110,7 @@ class ProtectedApiRunApprovalPolicy:
         run_id: Optional[str] = None,
         approval_session: Optional[str] = None,
         redacted_description: Optional[str] = None,
+        description_fn: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
     ) -> None:
         names = frozenset(_normalize_allowlist_name(name) for name in allowed_tool_names)
         if not names:
@@ -112,6 +124,8 @@ class ProtectedApiRunApprovalPolicy:
         if approval_session is not None:
             _validate_identity(approval_session, "approval_session")
         description = _normalize_redacted_description(redacted_description)
+        if description_fn is not None and not callable(description_fn):
+            raise ValueError("description_fn must be callable")
         object.__setattr__(self, "allowed_tool_names", names)
         object.__setattr__(self, "user_session_id", user_session_id)
         object.__setattr__(self, "hermes_session_id", hermes_session_id)
@@ -120,6 +134,7 @@ class ProtectedApiRunApprovalPolicy:
         object.__setattr__(self, "run_id", run_id)
         object.__setattr__(self, "approval_session", approval_session)
         object.__setattr__(self, "redacted_description", description)
+        object.__setattr__(self, "description_fn", description_fn)
 
     def allows_tool(self, tool_name: str) -> bool:
         """Return whether *tool_name* is an exact, case-sensitive allowlist member."""
@@ -147,6 +162,7 @@ class ProtectedApiRunApprovalPolicy:
             run_id=run_id,
             approval_session=approval_session,
             redacted_description=self.redacted_description,
+            description_fn=self.description_fn,
         )
 
     def attach(self, **kwargs: Any) -> "ProtectedApiRunBinding":
@@ -196,6 +212,7 @@ class _PendingApproval:
     consumed: bool = False
     claimed: bool = False
     failure_message: Optional[str] = None
+    action_description: str = ""
 
 
 @dataclass(frozen=True)
@@ -340,18 +357,48 @@ def _active_stores_for(run_id: str, approval_session: Optional[str] = None) -> t
         })
 
 
+def _is_unsafe_text_char(char: str) -> bool:
+    """Return True for C0/C1 controls, DEL, and Unicode format (Cf) characters."""
+    cp = ord(char)
+    if cp < 32 or cp == 127 or (0x80 <= cp <= 0x9F):
+        return True
+    return unicodedata.category(char) == "Cf"
+
+
 def _normalize_redacted_description(value: Optional[str]) -> str:
     """Normalize the server-owned display text without consulting action arguments."""
     if value is None:
         return ""
     if not isinstance(value, str):
         raise ValueError("redacted_description must be a string")
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if any(_is_unsafe_text_char(char) for char in value):
         raise ValueError("redacted_description contains a control character")
     compact = " ".join(value.split())
     if len(compact) <= MAX_REDACTED_DESCRIPTION_LENGTH:
         return compact
     return compact[: MAX_REDACTED_DESCRIPTION_LENGTH - 1].rstrip() + "…"
+
+
+def _normalize_action_description(value: str) -> str:
+    """Normalize a per-call description returned by policy.description_fn.
+
+    Raises ``ValueError`` on any invalid input so the caller can fail the
+    request closed before creating a pending record.  Unlike
+    ``_normalize_redacted_description``, exceeding the length bound is an
+    error — silent truncation could produce a misleading partial description.
+    """
+    if not isinstance(value, str):
+        raise ValueError("action description must be a string")
+    if any(_is_unsafe_text_char(char) for char in value):
+        raise ValueError("action description contains a control character")
+    compact = " ".join(value.split())
+    if not compact:
+        raise ValueError("action description must not be empty or whitespace-only")
+    if len(compact) > MAX_ACTION_DESCRIPTION_LENGTH:
+        raise ValueError(
+            f"action description exceeds {MAX_ACTION_DESCRIPTION_LENGTH} characters"
+        )
+    return compact
 
 
 def _validate_identity(value: str, label: str) -> str:
@@ -459,7 +506,12 @@ def canonical_action_digest(tool_name: str, args: Mapping[str, Any]) -> str:
 
 def _safe_metadata(pending: _PendingApproval) -> Dict[str, Any]:
     """Build the only payload permitted to cross the pending-approval callback."""
-    description = pending.policy.redacted_description or f"Approve protected {pending.tool_name} action"
+    if pending.action_description:
+        # Per-call description from policy.description_fn; already normalized to ≤512
+        description = pending.action_description
+    else:
+        raw = pending.policy.redacted_description or f"Approve protected {pending.tool_name} action"
+        description = _normalize_redacted_description(raw)
     return {
         "approval_type": "protected_api_run",
         "run_id": pending.run_id,
@@ -469,7 +521,7 @@ def _safe_metadata(pending: _PendingApproval) -> Dict[str, Any]:
         "action_digest": pending.action_digest,
         "expires_at": pending.expires_at,
         "choices": ["once", "deny"],
-        "redacted_description": _normalize_redacted_description(description),
+        "redacted_description": description,
     }
 
 
@@ -642,6 +694,17 @@ class ProtectedApiRunApprovalStore:
         now = float(self._clock())
         if now >= policy.expires_at:
             return {"approved": False, "message": "BLOCKED: protected approval policy expired"}
+        # Generate the per-call description before taking the lock so a slow or
+        # failing description_fn never blocks the record ledger.  Fail closed if
+        # the callback raises or produces an invalid string.
+        action_description = ""
+        if policy.description_fn is not None:
+            try:
+                canonical_args = json.loads(canonical_args_json(args))
+                raw_desc = policy.description_fn(normalized_tool, canonical_args)
+                action_description = _normalize_action_description(raw_desc)
+            except Exception:
+                return {"approved": False, "message": "BLOCKED: action description failed"}
         key = (policy.run_id, policy.approval_session)
         with self._lock:
             now = float(self._clock())
@@ -679,6 +742,7 @@ class ProtectedApiRunApprovalStore:
                     policy_epoch=registered[2],
                     callback=pending_callback if pending_callback is not None else registered[1],
                     event=threading.Event(),
+                    action_description=action_description,
                 )
                 self._records[(record.run_id, record.approval_session, record.request_id)] = record
                 self._action_records[action_key] = record
