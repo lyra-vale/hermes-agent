@@ -888,7 +888,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
         try:
-            from tools.protected_api_approval import verify_protected_dispatch
+            from tools.protected_api_approval import (
+                clear_current_dispatch_attestation as _clear_attestation,
+                verify_protected_dispatch,
+            )
             if not verify_protected_dispatch(function_name, next_args):
                 return tool_error(
                     "BLOCKED: the protected API approval did not authorize this exact action"
@@ -905,7 +908,13 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        try:
+            return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        finally:
+            try:
+                _clear_attestation()
+            except Exception:
+                pass
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

@@ -53,6 +53,7 @@ __all__ = [
     "protected_observer_args", "safe_protected_observer_args",
     "protected_api_run_context_active", "protected_api_run_redaction_active",
     "protected_exception_diagnostic",
+    "has_current_dispatch_attestation", "clear_current_dispatch_attestation",
 ]
 
 _REQUIRED_APPROVAL_FIELDS = frozenset({"request_id", "action_digest", "choice"})
@@ -225,6 +226,20 @@ class _DispatchAuthorization:
     policy_epoch: int
 
 
+@dataclass(frozen=True)
+class _DispatchAttestation:
+    """Proof inside a handler invocation that this exact action passed the dispatch gate.
+
+    Set by verify_protected_dispatch (consume=True) after consuming the authorization
+    token; cleared by the dispatch boundary in all exit paths.  Handlers query it via
+    has_current_dispatch_attestation(); it is never accessible outside the handler call.
+    """
+
+    tool_name: str
+    args_digest: str
+    action_digest: str
+
+
 _CURRENT_API_RUN_CONTEXT: contextvars.ContextVar[Optional[_ApiRunContext]] = contextvars.ContextVar(
     "hermes_protected_api_run_context", default=None
 )
@@ -233,6 +248,11 @@ _CURRENT_BINDING: contextvars.ContextVar[Optional[ProtectedApiRunBinding]] = con
 )
 _CURRENT_AUTHORIZATION: contextvars.ContextVar[Optional[_DispatchAuthorization]] = contextvars.ContextVar(
     "hermes_protected_api_run_authorization", default=None
+)
+# Set after a successful consume-dispatch; cleared by the registry boundary finally block.
+# Handlers use has_current_dispatch_attestation() to prove their exact approved call.
+_CURRENT_DISPATCH_ATTESTATION: contextvars.ContextVar[Optional[_DispatchAttestation]] = contextvars.ContextVar(
+    "hermes_protected_dispatch_attestation", default=None
 )
 
 _ACTIVE_STORE_LOCK = threading.RLock()
@@ -1289,6 +1309,32 @@ def clear_current_protected_dispatch_authorization() -> None:
     _CURRENT_AUTHORIZATION.set(None)
 
 
+def clear_current_dispatch_attestation() -> None:
+    """Clear the per-handler dispatch attestation; called by the dispatch boundary finally."""
+    _CURRENT_DISPATCH_ATTESTATION.set(None)
+
+
+def has_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) -> bool:
+    """Return True iff this exact tool+args passed the protected dispatch gate in this invocation.
+
+    Intended for plugin handlers that need to confirm their call was approved.  Returns
+    False outside a handler invocation, for mismatched tool/args, or when the run is
+    unprotected.  Never raises; canonicalization failure is treated as no attestation.
+    """
+    attestation = _CURRENT_DISPATCH_ATTESTATION.get()
+    if attestation is None or attestation.tool_name != tool_name:
+        return False
+    try:
+        a_digest = canonical_action_digest(tool_name, args)
+        b_digest = canonical_args_digest(args)
+    except CanonicalActionError:
+        return False
+    return (
+        hmac.compare_digest(attestation.action_digest, a_digest)
+        and hmac.compare_digest(attestation.args_digest, b_digest)
+    )
+
+
 def _binding_is_active(binding: ProtectedApiRunBinding) -> bool:
     if binding.policy.run_id is None or _run_is_retired(binding.policy.run_id):
         return False
@@ -1433,6 +1479,12 @@ def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consum
         clear_current_protected_dispatch_authorization()
         return False
     if consume:
+        # Record the per-handler attestation before clearing the authorization token so
+        # the handler can prove its exact approved call via has_current_dispatch_attestation().
+        # The dispatch boundary (model_tools._dispatch) clears this in its finally block.
+        _CURRENT_DISPATCH_ATTESTATION.set(
+            _DispatchAttestation(tool_name=tool_name, args_digest=args_digest, action_digest=digest)
+        )
         clear_current_protected_dispatch_authorization()
     return True
 
