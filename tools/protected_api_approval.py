@@ -54,6 +54,7 @@ __all__ = [
     "protected_api_run_context_active", "protected_api_run_redaction_active",
     "protected_exception_diagnostic",
     "has_current_dispatch_attestation", "clear_current_dispatch_attestation",
+    "consume_current_dispatch_attestation",
 ]
 
 _REQUIRED_APPROVAL_FIELDS = frozenset({"request_id", "action_digest", "choice"})
@@ -1333,6 +1334,31 @@ def has_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) ->
         hmac.compare_digest(attestation.action_digest, a_digest)
         and hmac.compare_digest(attestation.args_digest, b_digest)
     )
+
+
+def consume_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) -> bool:
+    """Atomically verify and consume the dispatch attestation for this exact tool+args.
+
+    Returns True and clears the token if the attestation matches; returns False without
+    clearing if there is no attestation, the tool name differs, or the args digests do
+    not match the approved call.  A False result leaves the token intact so the correct
+    handler can still consume it.  Never raises.
+    """
+    attestation = _CURRENT_DISPATCH_ATTESTATION.get()
+    if attestation is None or attestation.tool_name != tool_name:
+        return False
+    try:
+        a_digest = canonical_action_digest(tool_name, args)
+        b_digest = canonical_args_digest(args)
+    except CanonicalActionError:
+        return False
+    if (
+        hmac.compare_digest(attestation.action_digest, a_digest)
+        and hmac.compare_digest(attestation.args_digest, b_digest)
+    ):
+        _CURRENT_DISPATCH_ATTESTATION.set(None)
+        return True
+    return False
 
 
 def _binding_is_active(binding: ProtectedApiRunBinding) -> bool:

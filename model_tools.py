@@ -905,10 +905,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
             _clear_protected_authorization_state()
             return tool_error("BLOCKED: protected API approval verification failed")
         from tools.tool_gateway.names import is_connector_name
-        if is_connector_name(function_name):
-            from model_tools_connectors import dispatch_connector_call
-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
         try:
+            if is_connector_name(function_name):
+                from model_tools_connectors import dispatch_connector_call
+                return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
             return registry.dispatch(function_name, next_args, **dispatch_kwargs)
         finally:
             try:
