@@ -175,6 +175,58 @@ def test_no_attestation_without_approved_protected_call(monkeypatch):
     assert unprotected_seen == [False], f"no attestation without approval, got {unprotected_seen}"
 
 
+def test_active_api_run_gets_one_use_attestation_for_core_dispatched_unprotected_call(monkeypatch):
+    """A live API run may attest exact dispatch without creating an approval binding."""
+    monkeypatch.setattr(
+        "acp_adapter.edit_approval.maybe_require_edit_approval",
+        lambda *a, **kw: None,
+    )
+    results = []
+
+    def checking_dispatch(name, args, **kwargs):
+        results.append(protected.consume_current_dispatch_attestation(name, args))
+        results.append(protected.consume_current_dispatch_attestation(name, args))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", checking_dispatch)
+    tokens = protected.set_current_api_run_context(
+        run_id="unapproved-run", approval_session="unapproved-session"
+    )
+    try:
+        model_tools.handle_function_call(
+            "write_file",
+            _args(),
+            task_id="active-api-task",
+            session_id="active-api-session",
+            skip_pre_tool_call_hook=True,
+            skip_tool_execution_middleware=True,
+        )
+    finally:
+        protected.reset_current_api_run_context(tokens)
+
+    assert results == [True, False]
+
+
+def test_direct_dispatch_in_active_api_run_has_no_attestation(monkeypatch):
+    """Only model_tools' final dispatch boundary can mint the one-use proof."""
+    seen = []
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda name, args, **kwargs: seen.append(
+            protected.consume_current_dispatch_attestation(name, args)
+        ) or json.dumps({"ok": True}),
+    )
+    tokens = protected.set_current_api_run_context(
+        run_id="direct-run", approval_session="direct-session"
+    )
+    try:
+        model_tools.registry.dispatch("write_file", _args())
+    finally:
+        protected.reset_current_api_run_context(tokens)
+    assert seen == [False]
+
+
 def test_attestation_cleared_when_handler_raises(monkeypatch):
     """Attestation is cleared even if the registry handler raises."""
     store = protected.ProtectedApiRunApprovalStore()
@@ -355,6 +407,63 @@ def test_attestation_cleared_after_connector_dispatch(monkeypatch):
         assert not protected.has_current_dispatch_attestation(_connector_tool(), conn_args), (
             "attestation must be cleared after connector dispatch"
         )
+
+
+def test_attestation_from_inline_dispatch_not_consumable_by_later_direct_handler(monkeypatch):
+    """An inline executor's one-use attestation must not leak past its own dispatch.
+
+    invoke_tool's inline-executor branch (agent_runtime_helpers.py) verifies dispatch
+    and mints an attestation the same way model_tools._dispatch does, but has no
+    matching finally-clear. A later direct handler call for the exact same tool+args
+    must not be able to claim that leaked token.
+    """
+    from types import SimpleNamespace
+
+    from agent import agent_runtime_helpers
+    from tools.todo_tool import TodoStore
+
+    agent = SimpleNamespace(session_id="inline-leak-session", _todo_store=TodoStore())
+    todo_args = {"todos": [{"id": "1", "content": "x", "status": "pending"}]}
+
+    tokens = protected.set_current_api_run_context(
+        run_id="inline-leak-run", approval_session="inline-leak-approval-session"
+    )
+    try:
+        result = agent_runtime_helpers.invoke_tool(
+            agent,
+            "todo_list",
+            todo_args,
+            "inline-leak-task",
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+        json.loads(result)  # sanity: the inline executor actually ran
+        assert protected.consume_current_dispatch_attestation("todo_list", todo_args) is False, (
+            "a later direct handler must not be able to consume the inline dispatch's token"
+        )
+    finally:
+        protected.reset_current_api_run_context(tokens)
+
+
+def test_run_context_reset_clears_minted_attestation():
+    """Resetting an active API run must invalidate any attestation minted under it.
+
+    A minted attestation is only proof for the exact call that crossed dispatch; once
+    the run context is reset (run retired / next run begins), a stale attestation for
+    the same tool+args must not still be claimable.
+    """
+    tokens = protected.set_current_api_run_context(
+        run_id="reset-run", approval_session="reset-session"
+    )
+    try:
+        assert protected.verify_protected_dispatch("write_file", _args()) is True
+        assert protected.has_current_dispatch_attestation("write_file", _args())
+    finally:
+        protected.reset_current_api_run_context(tokens)
+
+    assert protected.has_current_dispatch_attestation("write_file", _args()) is False
+    assert protected.consume_current_dispatch_attestation("write_file", _args()) is False
 
 
 def test_attestation_cleared_after_connector_exception(monkeypatch):

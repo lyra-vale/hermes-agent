@@ -229,11 +229,12 @@ class _DispatchAuthorization:
 
 @dataclass(frozen=True)
 class _DispatchAttestation:
-    """Proof inside a handler invocation that this exact action passed the dispatch gate.
+    """Proof inside a handler invocation that this exact action crossed core dispatch.
 
-    Set by verify_protected_dispatch (consume=True) after consuming the authorization
-    token; cleared by the dispatch boundary in all exit paths.  Handlers query it via
-    has_current_dispatch_attestation(); it is never accessible outside the handler call.
+    Set by verify_protected_dispatch (consume=True) after either consuming the
+    exact protected approval or validating an active, unbound API-run context;
+    cleared by the registry boundary in all exit paths. Handlers query it via
+    has_current_dispatch_attestation().
     """
 
     tool_name: str
@@ -972,7 +973,13 @@ def set_current_api_run_context(
 
 
 def reset_current_api_run_context(tokens) -> None:
-    """Reset an API-run context and discard any unconsumed dispatch authorization."""
+    """Reset an API-run context and discard any unconsumed dispatch authorization.
+
+    Also clears any per-handler dispatch attestation. A minted attestation only
+    proves that one exact call crossed dispatch under this run; leaving it set
+    across a run-context reset would let a later, unrelated run (or a stale
+    direct call after the run ends) claim a token it never earned.
+    """
     try:
         context_token, binding_token, authorization_token = tokens
         _CURRENT_AUTHORIZATION.reset(authorization_token)
@@ -982,6 +989,8 @@ def reset_current_api_run_context(tokens) -> None:
         _CURRENT_AUTHORIZATION.set(None)
         _CURRENT_BINDING.set(None)
         _CURRENT_API_RUN_CONTEXT.set(None)
+    finally:
+        _CURRENT_DISPATCH_ATTESTATION.set(None)
 
 
 def _clear_attachment_state_on_failure(function):
@@ -1316,11 +1325,12 @@ def clear_current_dispatch_attestation() -> None:
 
 
 def has_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) -> bool:
-    """Return True iff this exact tool+args passed the protected dispatch gate in this invocation.
+    """Return True iff this exact tool+args crossed the final core dispatch gate.
 
-    Intended for plugin handlers that need to confirm their call was approved.  Returns
-    False outside a handler invocation, for mismatched tool/args, or when the run is
-    unprotected.  Never raises; canonicalization failure is treated as no attestation.
+    Intended for plugin handlers that need to prove their call was dispatched
+    through core. Returns False outside a handler invocation, for mismatched
+    tool/args, or without either a protected approval or active API-run context.
+    Never raises; canonicalization failure is treated as no attestation.
     """
     attestation = _CURRENT_DISPATCH_ATTESTATION.get()
     if attestation is None or attestation.tool_name != tool_name:
@@ -1337,12 +1347,12 @@ def has_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) ->
 
 
 def consume_current_dispatch_attestation(tool_name: str, args: Mapping[str, Any]) -> bool:
-    """Atomically verify and consume the dispatch attestation for this exact tool+args.
+    """Atomically verify and consume this exact core-dispatch attestation.
 
-    Returns True and clears the token if the attestation matches; returns False without
-    clearing if there is no attestation, the tool name differs, or the args digests do
-    not match the approved call.  A False result leaves the token intact so the correct
-    handler can still consume it.  Never raises.
+    Returns True and clears the token if the attestation matches; returns False
+    without clearing if there is no attestation, the tool differs, or the args
+    digests do not match. A False result leaves the token intact so the correct
+    handler can still consume it. Never raises.
     """
     attestation = _CURRENT_DISPATCH_ATTESTATION.get()
     if attestation is None or attestation.tool_name != tool_name:
@@ -1467,10 +1477,11 @@ def require_protected_api_run_approval(
 def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consume: bool = True) -> bool:
     """Verify the exact action immediately before core/inline dispatch.
 
-    No active protected policy means legacy callers retain their existing path.
-    A retired binding, an allowlisted call with no authorization, or any changed
-    tool/arguments fails closed. ``consume=False`` is the outer agent preflight;
-    the registry boundary uses the default one-use consume operation.
+    Without a protected binding, legacy calls retain their path; an active,
+    unbound API run additionally receives a one-use handler attestation for its
+    exact dispatch. Retired contexts and mismatched protected actions fail
+    closed. ``consume=False`` is the outer agent preflight; the registry boundary
+    uses the default one-use consume operation.
     """
     had_binding = _CURRENT_BINDING.get() is not None
     try:
@@ -1480,7 +1491,29 @@ def verify_protected_dispatch(tool_name: str, args: Mapping[str, Any], *, consum
         return False
     if binding is None:
         clear_current_protected_dispatch_authorization()
-        return not had_binding
+        context = _CURRENT_API_RUN_CONTEXT.get()
+        if context is None:
+            return not had_binding
+        if (
+            context.protected_binding is not None
+            or _run_is_retired(context.run_id)
+            or _run_has_redaction_tombstone(context.run_id, context.approval_session)
+        ):
+            return False
+        try:
+            digest = canonical_action_digest(tool_name, args)
+            args_digest = canonical_args_digest(args)
+        except CanonicalActionError:
+            return False
+        if consume:
+            # An active API run can dispatch unprotected reads and explicitly
+            # adapter-authorized actions. The attestation proves only that this
+            # exact call crossed the core dispatcher; each handler still owns
+            # its action-specific authorization policy.
+            _CURRENT_DISPATCH_ATTESTATION.set(
+                _DispatchAttestation(tool_name=tool_name, args_digest=args_digest, action_digest=digest)
+            )
+        return True
     if not _binding_is_active(binding):
         clear_current_protected_dispatch_authorization()
         return False

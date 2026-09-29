@@ -2384,7 +2384,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             inline_ctx = InlineToolContext(
                 effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
             )
-            result = inline_executor(agent, next_args, inline_ctx)
+            try:
+                result = inline_executor(agent, next_args, inline_ctx)
+            finally:
+                # verify_protected_dispatch above may have minted a one-use dispatch
+                # attestation for this exact call. This inline branch is its own
+                # dispatch boundary (it never reaches model_tools._dispatch's own
+                # finally-clear), so it must clear the token itself or it leaks
+                # into whatever direct handler call runs next in this context.
+                try:
+                    from tools.protected_api_approval import clear_current_dispatch_attestation
+                    clear_current_dispatch_attestation()
+                except Exception:
+                    pass
             observer_args = _protected_observer_args_or_empty(
                 function_name, next_args if isinstance(next_args, dict) else function_args
             )
